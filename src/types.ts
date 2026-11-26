@@ -4,9 +4,11 @@ export type CaseStatus = 'todo' | 'in_progress' | 'done';
 
 export type SlaState = 'normal' | 'due_today' | 'overdue' | 'resolved';
 
-export type AlertStage = 'pre_30m' | 'due_reached';
+export type AlertStage = 'due_today' | 'overdue' | 'pre_30m' | 'due_reached';
 
-export type AckLevel = AlertStage | 'due_today' | 'overdue';
+export type AckLevel = AlertStage;
+
+export type EscalationStatus = 'pending' | 'accepted' | 'rejected';
 
 export interface Team {
   id: string;
@@ -92,6 +94,7 @@ export interface CaseItem {
   last_ack_at: string | null;
   last_ack_by_name: string | null;
   last_ack_level: string | null;
+  pending_escalation_id?: string;
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
@@ -105,6 +108,96 @@ export interface AckHistoryEntry {
   ack_level: string;
   note: string;
   ack_at: string;
+}
+
+export type AttachmentKind = 'image' | 'video' | 'file';
+
+export interface NoteAttachment {
+  id: string;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+  kind: AttachmentKind;
+  url: string;
+}
+
+export interface InternalNoteEditLog {
+  id: string;
+  note_id: string;
+  case_id: string;
+  editor_id: string;
+  editor_name: string;
+  editor_role: RoleLevel;
+  old_content: string;
+  new_content: string;
+  old_sla_due_at: string;
+  new_sla_due_at: string;
+  old_attachments_summary?: string;
+  new_attachments_summary?: string;
+  edited_at: string;
+}
+
+export interface InternalNote {
+  id: string;
+  case_id: string;
+  author_id: string;
+  author_name: string;
+  author_role: RoleLevel;
+  content: string;
+  sla_changed: boolean;
+  previous_sla_due_at: string;
+  new_sla_due_at: string;
+  attachments?: NoteAttachment[];
+  is_edited: boolean;
+  last_edited_by: string;
+  last_edited_by_name: string;
+  last_edit_log_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CaseEscalation {
+  id: string;
+  case_id: string;
+  case_no: string;
+  shop_id: string;
+  issue_summary: string;
+  details_preview: string;
+  sla_due_at: string;
+  from_user_id: string;
+  from_user_name: string;
+  from_team_id: string;
+  from_team_name: string;
+  to_user_id: string;
+  to_user_name: string;
+  to_team_id: string;
+  to_team_name: string;
+  note: string;
+  status: EscalationStatus;
+  reject_reason: string;
+  sender_ack_done: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CaseEscalationLog {
+  id: string;
+  case_id: string;
+  from_user_id: string;
+  from_user_name: string;
+  from_team_id: string;
+  from_team_name: string;
+  to_user_id: string;
+  to_user_name: string;
+  to_team_id: string;
+  to_team_name: string;
+  note: string;
+  status: EscalationStatus;
+  reject_reason: string;
+  sender_ack_done?: boolean;
+  sender_ack_at?: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface TeamStat {

@@ -2,17 +2,17 @@ import React from 'react';
 import {
   AlertTriangle,
   Check,
-  CheckCircle2,
-  Circle,
   Clock,
+  ExternalLink,
   Plus,
   Search,
 } from 'lucide-react';
+import { getSafeCaseUrl } from '../lib/caseLink.ts';
 import {
   computeAlertStage,
   computeLiveSlaState,
   formatSlaCountdown,
-  formatThaiDateTime,
+  formatThaiDate,
   getSlaLabel,
   getStatusLabel,
   needsUserAck,
@@ -35,7 +35,6 @@ interface CaseListViewProps {
   onSearchChange: (val: string) => void;
   onCreateCase: () => void;
   onInspectCase: (item: CaseItem) => void;
-  onQuickStatus: (item: CaseItem, nextStatus: CaseStatus) => Promise<void>;
   onAcknowledgeOne: (item: CaseItem) => Promise<void>;
 }
 
@@ -55,7 +54,6 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
   onSearchChange,
   onCreateCase,
   onInspectCase,
-  onQuickStatus,
   onAcknowledgeOne,
 }) => {
   const isAgent = currentUser.role === 'agent';
@@ -80,12 +78,6 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
     }
     return true;
   });
-
-  const cycleStatus = (c: CaseItem): CaseStatus => {
-    if (c.status === 'todo') return 'in_progress';
-    if (c.status === 'in_progress') return 'done';
-    return 'todo';
-  };
 
   return (
     <div className="space-y-5">
@@ -178,7 +170,7 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                 type="search"
                 value={searchQuery}
                 onChange={(e) => onSearchChange(e.target.value)}
-                placeholder="ค้นหาเลขเคส, ID SHOP, ปัญหา..."
+                placeholder="ค้นหาลิงก์เคส, ปัญหา, ผู้รับเรื่อง..."
                 className="w-full rounded-lg border border-slate-300 bg-white pl-9 pr-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:outline-none"
               />
             </div>
@@ -214,8 +206,7 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
-                  <th className="py-3 pl-5 pr-3 w-12">งาน</th>
-                  <th className="py-3 px-3">เลขเคส / ID SHOP</th>
+                  <th className="py-3 pl-5 pr-3">ลิงก์เคส / สถานะ</th>
                   <th className="py-3 px-3">รายละเอียดปัญหา &amp; บันทึก</th>
                   <th className="py-3 px-3">ทีม / ผู้รับเรื่อง</th>
                   <th className="py-3 px-3">SLA (วันครบกำหนด)</th>
@@ -229,39 +220,26 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                   const countdown = formatSlaCountdown(item.sla_due_at, item.status, nowMs);
                   const needsAckNow = needsUserAck(item, nowMs);
                   const userAckedCurrentStage = alertStage !== null && !needsAckNow;
+                  const safeCaseUrl = getSafeCaseUrl(item.case_no);
 
                   return (
                     <tr key={item.id} className="hover:bg-slate-50/80 transition-colors align-top">
-                      <td className="py-3.5 pl-5 pr-3">
-                        <button
-                          type="button"
-                          title={`เปลี่ยนสถานะเป็น ${getStatusLabel(cycleStatus(item))}`}
-                          onClick={() => onQuickStatus(item, cycleStatus(item))}
-                          className={`mt-0.5 transition-colors cursor-pointer ${
-                            item.status === 'done'
-                              ? 'text-emerald-600 hover:text-emerald-700'
-                              : item.status === 'in_progress'
-                                ? 'text-blue-600 hover:text-blue-700'
-                                : 'text-slate-400 hover:text-slate-700'
-                          }`}
-                        >
-                          {item.status === 'done' ? (
-                            <CheckCircle2 className="w-5 h-5" />
-                          ) : item.status === 'in_progress' ? (
-                            <Clock className="w-5 h-5" />
-                          ) : (
-                            <Circle className="w-5 h-5" />
-                          )}
-                        </button>
-                      </td>
-
-                      <td className="py-3.5 px-3 whitespace-nowrap">
-                        <div className="font-mono text-xs font-semibold text-slate-900 tabular-nums">
-                          {item.case_no}
-                        </div>
-                        <div className="font-mono text-xs text-slate-500 tabular-nums mt-0.5">
-                          SHOP {item.shop_id}
-                        </div>
+                      <td className="py-3.5 pl-5 pr-3 whitespace-nowrap">
+                        {safeCaseUrl ? (
+                          <a
+                            href={safeCaseUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-xs font-semibold text-blue-700 hover:text-blue-900 hover:underline"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                            <span>ลิงก์ไปที่เคส</span>
+                          </a>
+                        ) : (
+                          <div className="font-mono text-xs font-semibold text-slate-900 tabular-nums">
+                            {item.case_no}
+                          </div>
+                        )}
                         <div className="text-xs text-slate-500 mt-1">
                           {getStatusLabel(item.status)}
                         </div>
@@ -287,6 +265,11 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                       <td className="py-3.5 px-3 whitespace-nowrap">
                         <div className="text-xs font-medium text-slate-900">{item.team_name}</div>
                         <div className="text-xs text-slate-500 mt-0.5">{item.assignee_name}</div>
+                        {item.pending_escalation_id && (
+                          <div className="text-xs font-medium text-amber-700 mt-0.5">
+                            รอการตอบรับ Escalate
+                          </div>
+                        )}
                       </td>
 
                       <td className="py-3.5 px-3 whitespace-nowrap">
@@ -306,7 +289,7 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                           <span>{getSlaLabel(liveSla)}</span>
                         </div>
                         <div className="text-xs text-slate-500 font-mono tabular-nums mt-0.5">
-                          {formatThaiDateTime(item.sla_due_at)}
+                          {formatThaiDate(item.sla_due_at)}
                         </div>
                         <div className="text-xs text-slate-500 tabular-nums mt-0.5">
                           {countdown}
@@ -323,7 +306,7 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                               type="button"
                               onClick={() => onAcknowledgeOne(item)}
                               className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium text-white transition-colors whitespace-nowrap cursor-pointer ${
-                                alertStage === 'due_reached'
+                                alertStage === 'overdue'
                                   ? 'bg-red-600 hover:bg-red-700'
                                   : 'bg-amber-600 hover:bg-amber-700'
                               }`}
@@ -337,7 +320,7 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                             onClick={() => onInspectCase(item)}
                             className="rounded-lg border border-slate-300 bg-white hover:bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors whitespace-nowrap cursor-pointer"
                           >
-                            {currentUser.role === 'tl' || currentUser.role === 'admin'
+                            {currentUser.role === 'admin'
                               ? 'ตรวจสอบ / แก้ไข'
                               : 'ดู / อัปเดต'}
                           </button>

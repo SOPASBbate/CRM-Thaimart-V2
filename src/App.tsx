@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import {
   AlertTriangle,
+  ArrowRightLeft,
   CheckSquare,
+  FileSpreadsheet,
   KeyRound,
   LayoutDashboard,
   LogOut,
@@ -17,21 +19,28 @@ import { CaseListView } from './components/CaseListView.tsx';
 import { CaseModal } from './components/CaseModal.tsx';
 import { ChangePasswordModal } from './components/ChangePasswordModal.tsx';
 import { DashboardView } from './components/DashboardView.tsx';
+import { EscalationAlertModal } from './components/EscalationAlertModal.tsx';
+import { GoogleSheetsBackupView } from './components/GoogleSheetsBackupView.tsx';
 import { LoginView } from './components/LoginView.tsx';
 import { SlaAlertModal } from './components/SlaAlertModal.tsx';
 import { unlockAudio } from './lib/bell.ts';
 import { auth } from './lib/firebase.ts';
 import {
+  acceptCaseEscalationDoc,
   acknowledgeCaseForUser,
   acknowledgeCasesBulkForUser,
+  acknowledgeRejectedEscalationDoc,
   buildDashboardSummary,
   enrichCasesForUser,
+  rejectCaseEscalationDoc,
   resolveAuthenticatedUser,
   signOutFirebase,
   subscribeActiveUsers,
+  subscribeIncomingEscalations,
   subscribeMyCaseAcks,
   subscribePositions,
   subscribeRawCases,
+  subscribeRejectedOutgoingEscalations,
   subscribeStaffDirectory,
   subscribeTeams,
   updateCaseDoc,
@@ -39,6 +48,7 @@ import {
 } from './lib/firestoreService.ts';
 import { computeAlertStage, needsUserAck } from './lib/sla.ts';
 import type {
+  CaseEscalation,
   CaseItem,
   CaseStatus,
   Position,
@@ -48,7 +58,7 @@ import type {
   UserPublic,
 } from './types.ts';
 
-type NavView = 'dashboard' | 'cases' | 'admin';
+type NavView = 'dashboard' | 'cases' | 'backup' | 'admin';
 
 export default function App() {
   const [checkingAuth, setCheckingAuth] = useState(true);
@@ -64,6 +74,8 @@ export default function App() {
   const [staffList, setStaffList] = useState<StaffEntry[]>([]);
   const [rawCases, setRawCases] = useState<RawCaseDoc[]>([]);
   const [myCaseAcks, setMyCaseAcks] = useState<UserCaseAck[]>([]);
+  const [incomingEscalations, setIncomingEscalations] = useState<CaseEscalation[]>([]);
+  const [rejectedEscalations, setRejectedEscalations] = useState<CaseEscalation[]>([]);
   const [loadingData, setLoadingData] = useState(true);
 
   // Live clock for real-time SLA countdowns & automatic SLA alert transitions
@@ -80,10 +92,13 @@ export default function App() {
   const [editingCase, setEditingCase] = useState<CaseItem | null>(null);
   const [alertModalOpen, setAlertModalOpen] = useState(false);
   const [alertNonce, setAlertNonce] = useState(0);
+  const [escalationModalOpen, setEscalationModalOpen] = useState(false);
+  const [escalationAlertNonce, setEscalationAlertNonce] = useState(0);
   const [changePasswordOpen, setChangePasswordOpen] = useState(false);
 
-  // Track which alert signatures (id:sla_due_at:stage) were already triggered automatically
+  // Track which alert signatures were already triggered automatically
   const seenAlertKeysRef = useRef<Set<string>>(new Set());
+  const seenEscalationKeysRef = useRef<Set<string>>(new Set());
 
   if (firestoreError) {
     throw firestoreError;
@@ -98,12 +113,16 @@ export default function App() {
     setCurrentUser(null);
     setRawCases([]);
     setMyCaseAcks([]);
+    setIncomingEscalations([]);
+    setRejectedEscalations([]);
     setTeams([]);
     setPositions([]);
     setActiveUsers([]);
     setStaffList([]);
     setAlertModalOpen(false);
+    setEscalationModalOpen(false);
     seenAlertKeysRef.current.clear();
+    seenEscalationKeysRef.current.clear();
     setActiveView('dashboard');
   }, []);
 
@@ -124,6 +143,7 @@ export default function App() {
         const profile = await resolveAuthenticatedUser(firebaseUser);
         if (!active) return;
         seenAlertKeysRef.current.clear();
+        seenEscalationKeysRef.current.clear();
         setCurrentUser(profile);
       } catch (err) {
         if (!active) return;
@@ -169,6 +189,10 @@ export default function App() {
     unsubs.push(subscribePositions(setPositions, onErr));
     unsubs.push(subscribeActiveUsers(setActiveUsers, onErr));
     unsubs.push(subscribeMyCaseAcks(currentUser.uid, setMyCaseAcks, onErr));
+    unsubs.push(subscribeIncomingEscalations(currentUser.uid, setIncomingEscalations, onErr));
+    unsubs.push(
+      subscribeRejectedOutgoingEscalations(currentUser.uid, setRejectedEscalations, onErr)
+    );
     unsubs.push(
       subscribeRawCases(
         currentUser,
@@ -212,12 +236,12 @@ export default function App() {
     return activeUsers;
   }, [currentUser, activeUsers]);
 
-  // Compute unacknowledged SLA alerts for the current user (30m before due + at due time)
+  // Compute unacknowledged SLA alerts for the current user (due today + overdue)
   const unacknowledgedAlerts = useMemo(() => {
     return cases.filter((c) => needsUserAck(c, nowMs));
   }, [cases, nowMs]);
 
-  // Trigger SLA Alert Popup immediately when a new stage (pre_30m or due_reached) enters
+  // Trigger SLA Alert Popup immediately when a new stage (due_today or overdue) enters
   useEffect(() => {
     if (!currentUser) return;
 
@@ -257,6 +281,53 @@ export default function App() {
     return () => clearInterval(repeatTimer);
   }, [currentUser, unacknowledgedAlerts.length, caseModalOpen]);
 
+  const totalEscalationAlerts = incomingEscalations.length + rejectedEscalations.length;
+
+  // Trigger Escalation Alert Popup immediately on incoming handoff or returned rejection
+  useEffect(() => {
+    if (!currentUser) return;
+
+    if (totalEscalationAlerts === 0) {
+      setEscalationModalOpen(false);
+      return;
+    }
+
+    let hasNew = false;
+    for (const esc of incomingEscalations) {
+      const key = `inc:${esc.id}`;
+      if (!seenEscalationKeysRef.current.has(key)) {
+        seenEscalationKeysRef.current.add(key);
+        hasNew = true;
+      }
+    }
+    for (const esc of rejectedEscalations) {
+      const key = `rej:${esc.id}`;
+      if (!seenEscalationKeysRef.current.has(key)) {
+        seenEscalationKeysRef.current.add(key);
+        hasNew = true;
+      }
+    }
+
+    if (hasNew) {
+      setEscalationModalOpen(true);
+      setEscalationAlertNonce((n) => n + 1);
+    }
+  }, [currentUser, incomingEscalations, rejectedEscalations, totalEscalationAlerts]);
+
+  // Repeat Escalation Popup every 30s until Accepted/Rejected or sender acknowledges return
+  useEffect(() => {
+    if (!currentUser || totalEscalationAlerts === 0 || caseModalOpen) {
+      return;
+    }
+
+    const repeatTimer = setInterval(() => {
+      setEscalationModalOpen(true);
+      setEscalationAlertNonce((n) => n + 1);
+    }, 30000);
+
+    return () => clearInterval(repeatTimer);
+  }, [currentUser, totalEscalationAlerts, caseModalOpen]);
+
   const handleQuickStatus = async (item: CaseItem, nextStatus: CaseStatus) => {
     if (!currentUser) return;
     await updateCaseDoc(currentUser, item, { status: nextStatus }, cases);
@@ -273,6 +344,26 @@ export default function App() {
     setAlertModalOpen(false);
   };
 
+  const handleAcceptEscalation = async (esc: CaseEscalation) => {
+    await acceptCaseEscalationDoc(esc);
+  };
+
+  const handleRejectEscalation = async (esc: CaseEscalation, reason: string) => {
+    await rejectCaseEscalationDoc(esc, reason);
+  };
+
+  const handleAcknowledgeRejectedEscalation = async (esc: CaseEscalation) => {
+    await acknowledgeRejectedEscalationDoc(esc);
+  };
+
+  const handleInspectCaseById = (caseId: string) => {
+    const matched = cases.find((c) => c.id === caseId);
+    if (matched) {
+      setEditingCase(matched);
+      setCaseModalOpen(true);
+    }
+  };
+
   if (!currentUser) {
     return (
       <LoginView
@@ -286,6 +377,7 @@ export default function App() {
   const navItems: { id: NavView; label: string; icon: typeof LayoutDashboard }[] = [
     { id: 'dashboard', label: 'แดชบอร์ดติดตามเคส', icon: LayoutDashboard },
     { id: 'cases', label: 'รายการเคส To-Do', icon: CheckSquare },
+    { id: 'backup', label: 'สำรองข้อมูล Google ชีต', icon: FileSpreadsheet },
   ];
   if (currentUser.role === 'admin') {
     navItems.push({ id: 'admin', label: 'จัดการผู้ใช้และทีม', icon: Shield });
@@ -296,7 +388,9 @@ export default function App() {
       ? 'แดชบอร์ดติดตามเคส'
       : activeView === 'cases'
         ? 'รายการเคส To-Do'
-        : 'จัดการระบบ (Admin)';
+        : activeView === 'backup'
+          ? 'สำรองข้อมูล Google ชีต'
+          : 'จัดการระบบ (Admin)';
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex">
@@ -470,6 +564,17 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-3 shrink-0">
+            {totalEscalationAlerts > 0 && (
+              <button
+                type="button"
+                onClick={() => setEscalationModalOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 text-xs font-semibold text-indigo-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <ArrowRightLeft className="w-3.5 h-3.5 shrink-0" />
+                <span className="tabular-nums">แจ้งเตือนส่งต่อ ({totalEscalationAlerts})</span>
+              </button>
+            )}
+
             {unacknowledgedAlerts.length > 0 && (
               <button
                 type="button"
@@ -545,8 +650,16 @@ export default function App() {
                 setEditingCase(item);
                 setCaseModalOpen(true);
               }}
-              onQuickStatus={handleQuickStatus}
               onAcknowledgeOne={(item) => handleAcknowledgeOne(item)}
+            />
+          )}
+
+          {activeView === 'backup' && (
+            <GoogleSheetsBackupView
+              currentUser={currentUser}
+              cases={cases}
+              teams={teams}
+              nowMs={nowMs}
             />
           )}
 
@@ -569,7 +682,13 @@ export default function App() {
         currentUser={currentUser}
         teams={teams}
         assignableUsers={assignableUsers}
+        allActiveUsers={activeUsers}
         existingCases={cases}
+        incomingEscalations={incomingEscalations}
+        rejectedEscalations={rejectedEscalations}
+        onAcceptEscalation={handleAcceptEscalation}
+        onRejectEscalation={handleRejectEscalation}
+        onAcknowledgeRejectedEscalation={handleAcknowledgeRejectedEscalation}
         onClose={() => {
           setCaseModalOpen(false);
           setEditingCase(null);
@@ -589,6 +708,19 @@ export default function App() {
           setCaseModalOpen(true);
         }}
         onClose={() => setAlertModalOpen(false)}
+      />
+
+      {/* Real-time Escalation Incoming & Rejected Return Alert Popup */}
+      <EscalationAlertModal
+        open={escalationModalOpen}
+        incomingEscalations={incomingEscalations}
+        rejectedEscalations={rejectedEscalations}
+        alertNonce={escalationAlertNonce}
+        onAccept={handleAcceptEscalation}
+        onReject={handleRejectEscalation}
+        onAcknowledgeRejected={handleAcknowledgeRejectedEscalation}
+        onInspectCaseById={handleInspectCaseById}
+        onClose={() => setEscalationModalOpen(false)}
       />
       {/* Change Own Password Modal */}
       <ChangePasswordModal

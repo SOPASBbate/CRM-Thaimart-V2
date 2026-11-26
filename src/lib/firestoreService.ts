@@ -29,14 +29,28 @@ import {
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { auth, db, handleFirestoreError, OperationType } from './firebase.ts';
-import { computeAlertStage, computeLiveSlaState, needsUserAck } from './sla.ts';
+import {
+  deleteServerAttachment,
+  MAX_NOTE_ATTACHMENTS,
+  summarizeAttachments,
+} from './attachments.ts';
+import { getSafeCaseUrl, MAX_CASE_LINK_LENGTH, normalizeCaseUrl } from './caseLink.ts';
+import type { CaseBackupSnapshot } from './googleSheetsBackup.ts';
+import { computeAlertStage, computeLiveSlaState, needsUserAck, toLocalDateInput } from './sla.ts';
 import type {
   AckHistoryEntry,
   AlertStage,
   AssigneeStat,
+  AttachmentKind,
+  CaseEscalation,
+  CaseEscalationLog,
   CaseItem,
   CaseStatus,
   DashboardSummary,
+  EscalationStatus,
+  InternalNote,
+  InternalNoteEditLog,
+  NoteAttachment,
   Position,
   RoleLevel,
   StaffEntry,
@@ -133,6 +147,26 @@ export function mapAuthErrorMessage(err: unknown, context: 'login' | 'create', u
     return err;
   }
   return err instanceof Error ? err : new Error(msg);
+}
+
+export function formatActionErrorMessage(err: unknown, fallback: string): string {
+  const raw = err instanceof Error ? err.message : String(err ?? '');
+  if (!raw) return fallback;
+  if (raw.startsWith('{') && raw.includes('"error"')) {
+    try {
+      const parsed = JSON.parse(raw) as { error?: string };
+      if (parsed.error?.includes('Missing or insufficient permissions')) {
+        return 'ไม่มีสิทธิ์ทำรายการนี้ หรือสถานะเคสมีการเปลี่ยนแปลงแล้ว กรุณารีเฟรชและลองใหม่อีกครั้ง';
+      }
+      if (parsed.error) return parsed.error;
+    } catch {
+      // fall through
+    }
+  }
+  if (raw.includes('Missing or insufficient permissions')) {
+    return 'ไม่มีสิทธิ์ทำรายการนี้ หรือสถานะเคสมีการเปลี่ยนแปลงแล้ว กรุณารีเฟรชและลองใหม่อีกครั้ง';
+  }
+  return raw;
 }
 
 export async function isBootstrapNeeded(): Promise<boolean> {
@@ -615,7 +649,7 @@ export function subscribeMyCaseAcks(
           id: d.id,
           case_id: String(data.case_id ?? ''),
           user_id: String(data.user_id ?? uid),
-          ack_stage: (data.ack_stage as AlertStage) ?? 'pre_30m',
+          ack_stage: (data.ack_stage as AlertStage) ?? 'due_today',
           sla_due_at: String(data.sla_due_at ?? ''),
           ack_at: timestampToIso(data.ack_at),
         };
@@ -649,6 +683,7 @@ export interface RawCaseDoc {
   last_ack_by_name: string | null;
   last_ack_level: string | null;
   resolved_at: string | null;
+  pending_escalation_id?: string;
   created_at: string;
   updated_at: string;
 }
@@ -686,6 +721,7 @@ export function subscribeRawCases(
           last_ack_by_name: data.last_ack_by_name ? String(data.last_ack_by_name) : null,
           last_ack_level: data.last_ack_level ? String(data.last_ack_level) : null,
           resolved_at: data.resolved_at ? String(data.resolved_at) : null,
+          pending_escalation_id: data.pending_escalation_id ? String(data.pending_escalation_id) : '',
           created_at: timestampToIso(data.created_at),
           updated_at: timestampToIso(data.updated_at),
         };
@@ -711,7 +747,7 @@ export function enrichCasesForUser(
 ): CaseItem[] {
   const ackMap = new Map<string, AlertStage[]>();
   for (const ack of myAcks) {
-    const key = `${ack.case_id}:${ack.sla_due_at}`;
+    const key = `${ack.case_id}:${toLocalDateInput(ack.sla_due_at)}`;
     const list = ackMap.get(key) ?? [];
     list.push(ack.ack_stage);
     ackMap.set(key, list);
@@ -720,13 +756,16 @@ export function enrichCasesForUser(
   const enriched = rawCases.map((row): CaseItem => {
     const slaState = computeLiveSlaState(row.sla_due_at, row.status, nowMs);
     const alertStage = computeAlertStage(row.sla_due_at, row.status, nowMs);
-    const myAckStages = ackMap.get(`${row.id}:${row.sla_due_at}`) ?? [];
+    const myAckStages = ackMap.get(`${row.id}:${toLocalDateInput(row.sla_due_at)}`) ?? [];
 
     let needsAck = false;
-    if (alertStage === 'pre_30m') {
-      needsAck = !myAckStages.includes('pre_30m') && !myAckStages.includes('due_reached');
-    } else if (alertStage === 'due_reached') {
-      needsAck = !myAckStages.includes('due_reached');
+    if (alertStage === 'due_today') {
+      needsAck =
+        !myAckStages.includes('due_today') &&
+        !myAckStages.includes('overdue') &&
+        !myAckStages.includes('due_reached');
+    } else if (alertStage === 'overdue') {
+      needsAck = !myAckStages.includes('overdue') && !myAckStages.includes('due_reached');
     }
 
     return {
@@ -742,7 +781,7 @@ export function enrichCasesForUser(
   enriched.sort((a, b) => {
     if (a.status === 'done' && b.status !== 'done') return 1;
     if (a.status !== 'done' && b.status === 'done') return -1;
-    return new Date(a.sla_due_at).getTime() - new Date(b.sla_due_at).getTime();
+    return toLocalDateInput(a.sla_due_at).localeCompare(toLocalDateInput(b.sla_due_at));
   });
 
   return enriched;
@@ -851,7 +890,7 @@ export async function createCaseDoc(
   currentUser: UserPublic,
   input: {
     case_no: string;
-    shop_id: string;
+    shop_id?: string;
     issue_summary: string;
     details: string;
     status: CaseStatus;
@@ -859,17 +898,22 @@ export async function createCaseDoc(
   },
   existingCases: CaseItem[]
 ): Promise<void> {
-  const caseNo = input.case_no.trim().slice(0, 64);
-  const shopId = input.shop_id.trim().slice(0, 64);
+  const rawCaseNo = input.case_no.trim().slice(0, MAX_CASE_LINK_LENGTH);
+  const shopId = (input.shop_id ?? '').trim().slice(0, 64);
   const issueSummary = input.issue_summary.trim().slice(0, 300);
   const details = input.details.trim().slice(0, 4000);
 
-  if (!caseNo || !shopId || !issueSummary || !input.sla_due_at) {
-    throw new Error('กรุณากรอกข้อมูลเลขเคส, ID SHOP, รายละเอียดปัญหา และวันครบกำหนด SLA ให้ครบถ้วน');
+  if (!rawCaseNo || !issueSummary || !input.sla_due_at) {
+    throw new Error('กรุณากรอกข้อมูลลิงก์เคส, รายละเอียดปัญหา และวันครบกำหนด SLA ให้ครบถ้วน');
+  }
+
+  const caseNo = normalizeCaseUrl(rawCaseNo);
+  if (!caseNo) {
+    throw new Error('กรุณาระบุลิงก์เคส (URL) ที่ถูกต้อง โดยขึ้นต้นด้วย https:// หรือ http:// (ไม่เกิน 1,000 ตัวอักษร)');
   }
 
   if (existingCases.some((c) => c.case_no.toLowerCase() === caseNo.toLowerCase())) {
-    throw new Error(`เลขเคส "${caseNo}" มีอยู่ในระบบแล้ว`);
+    throw new Error('ลิงก์เคสนี้มีอยู่ในระบบแล้ว');
   }
 
   const newRef = doc(collection(db, 'cases'));
@@ -893,6 +937,7 @@ export async function createCaseDoc(
     last_ack_by_name: '',
     last_ack_level: '',
     resolved_at: resolvedAt,
+    pending_escalation_id: '',
     created_at: serverTimestamp(),
     updated_at: serverTimestamp(),
   }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `cases/${newRef.id}`));
@@ -915,30 +960,42 @@ export async function updateCaseDoc(
   },
   existingCases: CaseItem[]
 ): Promise<void> {
-  const caseNo = (input.case_no ?? editingCase.case_no).trim().slice(0, 64);
-  if (
-    caseNo.toLowerCase() !== editingCase.case_no.toLowerCase() &&
-    existingCases.some((c) => c.id !== editingCase.id && c.case_no.toLowerCase() === caseNo.toLowerCase())
-  ) {
-    throw new Error(`เลขเคส "${caseNo}" มีอยู่ในระบบแล้ว`);
-  }
-
+  const isAdmin = currentUser.role === 'admin';
   const nextStatus = input.status ?? editingCase.status;
   const resolvedAt =
     nextStatus === 'done' ? (editingCase.resolved_at || new Date().toISOString()) : '';
 
   const payload: Record<string, unknown> = {
-    case_no: caseNo,
-    shop_id: (input.shop_id ?? editingCase.shop_id).trim().slice(0, 64),
-    issue_summary: (input.issue_summary ?? editingCase.issue_summary).trim().slice(0, 300),
-    details: (input.details ?? editingCase.details).trim().slice(0, 4000),
     status: nextStatus,
     sla_due_at: (input.sla_due_at ?? editingCase.sla_due_at).slice(0, 64),
     resolved_at: resolvedAt,
     updated_at: serverTimestamp(),
   };
 
-  if (currentUser.role === 'admin' || currentUser.role === 'tl') {
+  if (isAdmin) {
+    const rawCaseNo = (input.case_no ?? editingCase.case_no).trim().slice(0, MAX_CASE_LINK_LENGTH);
+    if (!rawCaseNo) {
+      throw new Error('กรุณาระบุลิงก์เคส (URL)');
+    }
+    const requiresUrlCheck =
+      rawCaseNo !== editingCase.case_no || getSafeCaseUrl(editingCase.case_no) !== null;
+    const caseNo = requiresUrlCheck ? normalizeCaseUrl(rawCaseNo) : rawCaseNo;
+    if (!caseNo) {
+      throw new Error('กรุณาระบุลิงก์เคส (URL) ที่ถูกต้อง โดยขึ้นต้นด้วย https:// หรือ http:// (ไม่เกิน 1,000 ตัวอักษร)');
+    }
+    if (
+      caseNo.toLowerCase() !== editingCase.case_no.toLowerCase() &&
+      existingCases.some((c) => c.id !== editingCase.id && c.case_no.toLowerCase() === caseNo.toLowerCase())
+    ) {
+      throw new Error('ลิงก์เคสนี้มีอยู่ในระบบแล้ว');
+    }
+    payload.case_no = caseNo;
+    payload.shop_id = (input.shop_id ?? editingCase.shop_id).trim().slice(0, 64);
+    payload.issue_summary = (input.issue_summary ?? editingCase.issue_summary).trim().slice(0, 300);
+    payload.details = (input.details ?? editingCase.details).trim().slice(0, 4000);
+  }
+
+  if (isAdmin || currentUser.role === 'tl') {
     if (input.team_id && input.team_name) {
       payload.team_id = input.team_id;
       payload.team_name = input.team_name.slice(0, 80);
@@ -955,9 +1012,73 @@ export async function updateCaseDoc(
 }
 
 export async function deleteCaseDoc(caseId: string): Promise<void> {
-  await deleteDoc(doc(db, 'cases', caseId)).catch((err) =>
-    handleFirestoreError(err, OperationType.DELETE, `cases/${caseId}`)
-  );
+  const notesSnap = await getDocs(
+    query(collection(db, 'cases', caseId, 'internal_notes'), where('case_id', '==', caseId))
+  ).catch((err) => handleFirestoreError(err, OperationType.LIST, `cases/${caseId}/internal_notes`));
+
+  const refsToDelete = [doc(db, 'cases', caseId)];
+  const attachmentIdsToDelete: string[] = [];
+
+  for (const noteDoc of notesSnap.docs) {
+    const noteData = noteDoc.data() as Record<string, unknown>;
+    if (Array.isArray(noteData.attachments)) {
+      for (const att of noteData.attachments) {
+        if (att && typeof att === 'object' && typeof (att as { id?: unknown }).id === 'string') {
+          attachmentIdsToDelete.push((att as { id: string }).id);
+        }
+      }
+    }
+    const logsSnap = await getDocs(
+      query(
+        collection(db, 'cases', caseId, 'internal_notes', noteDoc.id, 'edit_logs'),
+        where('case_id', '==', caseId),
+        where('note_id', '==', noteDoc.id)
+      )
+    ).catch((err) =>
+      handleFirestoreError(err, OperationType.LIST, `cases/${caseId}/internal_notes/${noteDoc.id}/edit_logs`)
+    );
+    for (const logDoc of logsSnap.docs) {
+      refsToDelete.push(logDoc.ref);
+    }
+    refsToDelete.push(noteDoc.ref);
+  }
+
+  const acksSnap = await getDocs(
+    query(collection(db, 'cases', caseId, 'acknowledgments'), where('case_id', '==', caseId))
+  ).catch((err) => handleFirestoreError(err, OperationType.LIST, `cases/${caseId}/acknowledgments`));
+  for (const ackDoc of acksSnap.docs) {
+    refsToDelete.push(ackDoc.ref);
+  }
+
+  const escLogsSnap = await getDocs(
+    query(collection(db, 'cases', caseId, 'escalation_logs'), where('case_id', '==', caseId))
+  ).catch((err) => handleFirestoreError(err, OperationType.LIST, `cases/${caseId}/escalation_logs`));
+  for (const logDoc of escLogsSnap.docs) {
+    refsToDelete.push(logDoc.ref);
+  }
+
+  const escSnap = await getDocs(
+    query(collection(db, 'case_escalations'), where('case_id', '==', caseId))
+  ).catch((err) => handleFirestoreError(err, OperationType.LIST, 'case_escalations'));
+  for (const escDoc of escSnap.docs) {
+    refsToDelete.push(escDoc.ref);
+  }
+
+  for (let i = 0; i < refsToDelete.length; i += 400) {
+    const batch = writeBatch(db);
+    for (const ref of refsToDelete.slice(i, i + 400)) {
+      batch.delete(ref);
+    }
+    await batch
+      .commit()
+      .catch((err) => handleFirestoreError(err, OperationType.DELETE, `cases/${caseId}`));
+  }
+
+  if (attachmentIdsToDelete.length > 0) {
+    await Promise.all(
+      attachmentIdsToDelete.map((attId) => deleteServerAttachment(caseId, attId))
+    );
+  }
 }
 
 export async function acknowledgeCaseForUser(
@@ -1075,6 +1196,562 @@ export async function fetchCaseAckHistory(caseId: string): Promise<AckHistoryEnt
   });
   entries.sort((a, b) => new Date(b.ack_at).getTime() - new Date(a.ack_at).getTime());
   return entries;
+}
+
+// ==================== INTERNAL NOTES & EDIT LOGS ====================
+
+function sanitizeAttachments(raw: unknown): NoteAttachment[] {
+  if (!Array.isArray(raw)) return [];
+  const out: NoteAttachment[] = [];
+  for (const item of raw.slice(0, MAX_NOTE_ATTACHMENTS)) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    const id = String(obj.id ?? '').trim();
+    const name = String(obj.name ?? '').trim().slice(0, 255);
+    const mimeType = String(obj.mime_type ?? 'application/octet-stream').trim().slice(0, 128);
+    const sizeBytes = Math.max(0, Math.round(Number(obj.size_bytes ?? 0)));
+    const rawKind = String(obj.kind ?? 'file');
+    const kind: AttachmentKind =
+      rawKind === 'image' || rawKind === 'video' || rawKind === 'file' ? rawKind : 'file';
+    const url = String(obj.url ?? '').trim().slice(0, 1024);
+    if (!id || !name || !url) continue;
+    out.push({ id, name, mime_type: mimeType, size_bytes: sizeBytes, kind, url });
+  }
+  return out;
+}
+
+export function subscribeCaseInternalNotes(
+  caseId: string,
+  onData: (notes: InternalNote[]) => void,
+  onError: (err: Error) => void
+): Unsubscribe {
+  const path = `cases/${caseId}/internal_notes`;
+  const q = query(collection(db, 'cases', caseId, 'internal_notes'), where('case_id', '==', caseId));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const list: InternalNote[] = snapshot.docs.map((d) => {
+        const data = d.data();
+        return {
+          id: d.id,
+          case_id: String(data.case_id ?? caseId),
+          author_id: String(data.author_id ?? ''),
+          author_name: String(data.author_name ?? ''),
+          author_role: (data.author_role as RoleLevel) ?? 'agent',
+          content: String(data.content ?? ''),
+          sla_changed: Boolean(data.sla_changed),
+          previous_sla_due_at: String(data.previous_sla_due_at ?? ''),
+          new_sla_due_at: String(data.new_sla_due_at ?? ''),
+          attachments: sanitizeAttachments(data.attachments),
+          is_edited: Boolean(data.is_edited),
+          last_edited_by: String(data.last_edited_by ?? ''),
+          last_edited_by_name: String(data.last_edited_by_name ?? ''),
+          last_edit_log_id: String(data.last_edit_log_id ?? ''),
+          created_at: timestampToIso(data.created_at),
+          updated_at: timestampToIso(data.updated_at),
+        };
+      });
+      list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      onData(list);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch (wrapped) {
+        onError(wrapped as Error);
+      }
+    }
+  );
+}
+
+export async function fetchInternalNoteEditLogs(
+  caseId: string,
+  noteId: string
+): Promise<InternalNoteEditLog[]> {
+  const path = `cases/${caseId}/internal_notes/${noteId}/edit_logs`;
+  const q = query(
+    collection(db, 'cases', caseId, 'internal_notes', noteId, 'edit_logs'),
+    where('case_id', '==', caseId),
+    where('note_id', '==', noteId)
+  );
+  const snap = await getDocs(q).catch((err) => handleFirestoreError(err, OperationType.LIST, path));
+  const logs: InternalNoteEditLog[] = snap.docs.map((d) => {
+    const data = d.data();
+    return {
+      id: d.id,
+      note_id: String(data.note_id ?? noteId),
+      case_id: String(data.case_id ?? caseId),
+      editor_id: String(data.editor_id ?? ''),
+      editor_name: String(data.editor_name ?? ''),
+      editor_role: (data.editor_role as RoleLevel) ?? 'agent',
+      old_content: String(data.old_content ?? ''),
+      new_content: String(data.new_content ?? ''),
+      old_sla_due_at: String(data.old_sla_due_at ?? ''),
+      new_sla_due_at: String(data.new_sla_due_at ?? ''),
+      old_attachments_summary: data.old_attachments_summary
+        ? String(data.old_attachments_summary)
+        : undefined,
+      new_attachments_summary: data.new_attachments_summary
+        ? String(data.new_attachments_summary)
+        : undefined,
+      edited_at: timestampToIso(data.edited_at),
+    };
+  });
+  logs.sort((a, b) => new Date(b.edited_at).getTime() - new Date(a.edited_at).getTime());
+  return logs;
+}
+
+export async function createInternalNoteDoc(
+  currentUser: UserPublic,
+  caseItem: CaseItem,
+  input: {
+    content: string;
+    adjustSla: boolean;
+    newSlaDueAt?: string;
+    attachments?: NoteAttachment[];
+  }
+): Promise<void> {
+  const content = input.content.trim().slice(0, 2000);
+  const attachments = sanitizeAttachments(input.attachments ?? []);
+  if (!content && attachments.length === 0) {
+    throw new Error('กรุณากรอกข้อความ Internal Note หรือแนบไฟล์อย่างน้อย 1 รายการ');
+  }
+
+  let prevSla = '';
+  let nextSla = '';
+  if (input.adjustSla) {
+    prevSla = toLocalDateInput(caseItem.sla_due_at) || caseItem.sla_due_at.slice(0, 64);
+    nextSla = toLocalDateInput(input.newSlaDueAt ?? '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(nextSla)) {
+      throw new Error('กรุณาระบุวันครบกำหนด SLA ใหม่ให้ถูกต้อง');
+    }
+    if (nextSla === prevSla) {
+      throw new Error('วันครบกำหนด SLA ใหม่ต้องแตกต่างจากวันเดิม');
+    }
+  }
+
+  const noteRef = doc(collection(db, 'cases', caseItem.id, 'internal_notes'));
+  const batch = writeBatch(db);
+
+  batch.set(noteRef, {
+    id: noteRef.id,
+    case_id: caseItem.id,
+    author_id: currentUser.uid,
+    author_name: currentUser.display_name.slice(0, 120),
+    author_role: currentUser.role,
+    content,
+    sla_changed: input.adjustSla,
+    previous_sla_due_at: prevSla,
+    new_sla_due_at: nextSla,
+    ...(attachments.length > 0 ? { attachments } : {}),
+    is_edited: false,
+    last_edited_by: '',
+    last_edited_by_name: '',
+    last_edit_log_id: '',
+    created_at: serverTimestamp(),
+    updated_at: serverTimestamp(),
+  });
+
+  if (input.adjustSla) {
+    batch.update(doc(db, 'cases', caseItem.id), {
+      sla_due_at: nextSla,
+      updated_at: serverTimestamp(),
+    });
+  }
+
+  await batch
+    .commit()
+    .catch((err) => handleFirestoreError(err, OperationType.WRITE, `cases/${caseItem.id}/internal_notes`));
+}
+
+export async function updateInternalNoteDoc(
+  currentUser: UserPublic,
+  caseItem: CaseItem,
+  note: InternalNote,
+  input: {
+    content: string;
+    newSlaDueAt?: string;
+    attachments?: NoteAttachment[];
+  }
+): Promise<void> {
+  const content = input.content.trim().slice(0, 2000);
+  const oldAttachments = sanitizeAttachments(note.attachments ?? []);
+  const nextAttachments =
+    input.attachments !== undefined ? sanitizeAttachments(input.attachments) : oldAttachments;
+
+  if (!content && nextAttachments.length === 0) {
+    throw new Error('กรุณากรอกข้อความ Internal Note หรือแนบไฟล์อย่างน้อย 1 รายการ');
+  }
+
+  const nextSla = note.sla_changed
+    ? toLocalDateInput(input.newSlaDueAt ?? note.new_sla_due_at)
+    : '';
+  if (note.sla_changed && !/^\d{4}-\d{2}-\d{2}$/.test(nextSla)) {
+    throw new Error('กรุณาระบุวันครบกำหนด SLA ให้ถูกต้อง');
+  }
+
+  const attachmentsChanged =
+    JSON.stringify(oldAttachments) !== JSON.stringify(nextAttachments);
+
+  if (content === note.content && nextSla === note.new_sla_due_at && !attachmentsChanged) {
+    throw new Error('ไม่มีการเปลี่ยนแปลงข้อมูลสำหรับบันทึก');
+  }
+
+  const logRef = doc(collection(db, 'cases', caseItem.id, 'internal_notes', note.id, 'edit_logs'));
+  const noteRef = doc(db, 'cases', caseItem.id, 'internal_notes', note.id);
+  const batch = writeBatch(db);
+
+  batch.set(logRef, {
+    id: logRef.id,
+    note_id: note.id,
+    case_id: caseItem.id,
+    editor_id: currentUser.uid,
+    editor_name: currentUser.display_name.slice(0, 120),
+    editor_role: currentUser.role,
+    old_content: note.content,
+    new_content: content,
+    old_sla_due_at: note.new_sla_due_at,
+    new_sla_due_at: nextSla,
+    ...(attachmentsChanged
+      ? {
+          old_attachments_summary: summarizeAttachments(oldAttachments),
+          new_attachments_summary: summarizeAttachments(nextAttachments),
+        }
+      : {}),
+    edited_at: serverTimestamp(),
+  });
+
+  batch.update(noteRef, {
+    content,
+    new_sla_due_at: nextSla,
+    ...(attachmentsChanged ? { attachments: nextAttachments } : {}),
+    is_edited: true,
+    last_edited_by: currentUser.uid,
+    last_edited_by_name: currentUser.display_name.slice(0, 120),
+    last_edit_log_id: logRef.id,
+    updated_at: serverTimestamp(),
+  });
+
+  if (note.sla_changed && nextSla !== note.new_sla_due_at) {
+    batch.update(doc(db, 'cases', caseItem.id), {
+      sla_due_at: nextSla,
+      updated_at: serverTimestamp(),
+    });
+  }
+
+  await batch
+    .commit()
+    .catch((err) =>
+      handleFirestoreError(err, OperationType.UPDATE, `cases/${caseItem.id}/internal_notes/${note.id}`)
+    );
+
+  // Clean up any removed attachments from backend storage after edit commits
+  if (attachmentsChanged) {
+    const nextIds = new Set(nextAttachments.map((a) => a.id));
+    for (const prev of oldAttachments) {
+      if (!nextIds.has(prev.id)) {
+        void deleteServerAttachment(caseItem.id, prev.id);
+      }
+    }
+  }
+}
+
+export async function deleteInternalNoteDoc(
+  caseId: string,
+  noteId: string,
+  attachments: NoteAttachment[] = []
+): Promise<void> {
+  const logsSnap = await getDocs(
+    query(
+      collection(db, 'cases', caseId, 'internal_notes', noteId, 'edit_logs'),
+      where('case_id', '==', caseId),
+      where('note_id', '==', noteId)
+    )
+  ).catch((err) =>
+    handleFirestoreError(err, OperationType.LIST, `cases/${caseId}/internal_notes/${noteId}/edit_logs`)
+  );
+
+  const batch = writeBatch(db);
+  for (const logDoc of logsSnap.docs) {
+    batch.delete(logDoc.ref);
+  }
+  batch.delete(doc(db, 'cases', caseId, 'internal_notes', noteId));
+
+  await batch
+    .commit()
+    .catch((err) =>
+      handleFirestoreError(err, OperationType.DELETE, `cases/${caseId}/internal_notes/${noteId}`)
+    );
+
+  for (const att of attachments) {
+    void deleteServerAttachment(caseId, att.id);
+  }
+}
+
+// ==================== CASE ESCALATION & HISTORY ====================
+
+function mapEscalationDoc(id: string, data: Record<string, unknown>): CaseEscalation {
+  return {
+    id,
+    case_id: String(data.case_id ?? ''),
+    case_no: String(data.case_no ?? ''),
+    shop_id: String(data.shop_id ?? ''),
+    issue_summary: String(data.issue_summary ?? ''),
+    details_preview: String(data.details_preview ?? ''),
+    sla_due_at: String(data.sla_due_at ?? ''),
+    from_user_id: String(data.from_user_id ?? ''),
+    from_user_name: String(data.from_user_name ?? ''),
+    from_team_id: String(data.from_team_id ?? ''),
+    from_team_name: String(data.from_team_name ?? ''),
+    to_user_id: String(data.to_user_id ?? ''),
+    to_user_name: String(data.to_user_name ?? ''),
+    to_team_id: String(data.to_team_id ?? ''),
+    to_team_name: String(data.to_team_name ?? ''),
+    note: String(data.note ?? ''),
+    status: (data.status as EscalationStatus) ?? 'pending',
+    reject_reason: String(data.reject_reason ?? ''),
+    sender_ack_done: Boolean(data.sender_ack_done),
+    created_at: timestampToIso(data.created_at),
+    updated_at: timestampToIso(data.updated_at),
+  };
+}
+
+export function subscribeIncomingEscalations(
+  uid: string,
+  onData: (items: CaseEscalation[]) => void,
+  onError: (err: Error) => void
+): Unsubscribe {
+  const path = 'case_escalations';
+  const q = query(collection(db, path), where('to_user_id', '==', uid));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const pending = snapshot.docs
+        .map((d) => mapEscalationDoc(d.id, d.data()))
+        .filter((item) => item.status === 'pending')
+        .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      onData(pending);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch (wrapped) {
+        onError(wrapped as Error);
+      }
+    }
+  );
+}
+
+export function subscribeRejectedOutgoingEscalations(
+  uid: string,
+  onData: (items: CaseEscalation[]) => void,
+  onError: (err: Error) => void
+): Unsubscribe {
+  const path = 'case_escalations';
+  const q = query(collection(db, path), where('from_user_id', '==', uid));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const rejected = snapshot.docs
+        .map((d) => mapEscalationDoc(d.id, d.data()))
+        .filter((item) => item.status === 'rejected' && !item.sender_ack_done)
+        .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+      onData(rejected);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch (wrapped) {
+        onError(wrapped as Error);
+      }
+    }
+  );
+}
+
+export function subscribeCaseEscalationLogs(
+  caseId: string,
+  onData: (logs: CaseEscalationLog[]) => void,
+  onError: (err: Error) => void
+): Unsubscribe {
+  const path = `cases/${caseId}/escalation_logs`;
+  const q = query(collection(db, 'cases', caseId, 'escalation_logs'), where('case_id', '==', caseId));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const logs: CaseEscalationLog[] = snapshot.docs.map((d) => {
+        const data = d.data();
+        return {
+          id: d.id,
+          case_id: String(data.case_id ?? caseId),
+          from_user_id: String(data.from_user_id ?? ''),
+          from_user_name: String(data.from_user_name ?? ''),
+          from_team_id: String(data.from_team_id ?? ''),
+          from_team_name: String(data.from_team_name ?? ''),
+          to_user_id: String(data.to_user_id ?? ''),
+          to_user_name: String(data.to_user_name ?? ''),
+          to_team_id: String(data.to_team_id ?? ''),
+          to_team_name: String(data.to_team_name ?? ''),
+          note: String(data.note ?? ''),
+          status: (data.status as EscalationStatus) ?? 'pending',
+          reject_reason: String(data.reject_reason ?? ''),
+          sender_ack_done: Boolean(data.sender_ack_done),
+          sender_ack_at: data.sender_ack_at ? timestampToIso(data.sender_ack_at) : '',
+          created_at: timestampToIso(data.created_at),
+          updated_at: timestampToIso(data.updated_at),
+        };
+      });
+      logs.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+      onData(logs);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch (wrapped) {
+        onError(wrapped as Error);
+      }
+    }
+  );
+}
+
+export async function createCaseEscalationDoc(
+  currentUser: UserPublic,
+  caseItem: CaseItem,
+  targetUser: UserPublic,
+  note: string
+): Promise<void> {
+  if (caseItem.pending_escalation_id) {
+    throw new Error('เคสนี้กำลังรอการตอบรับ Escalate อยู่แล้ว');
+  }
+  if (targetUser.uid === currentUser.uid) {
+    throw new Error('ไม่สามารถส่งต่อเคสให้ตัวเองได้');
+  }
+
+  const escRef = doc(collection(db, 'case_escalations'));
+  const escLogRef = doc(db, 'cases', caseItem.id, 'escalation_logs', escRef.id);
+  const caseRef = doc(db, 'cases', caseItem.id);
+  const cleanNote = note.trim().slice(0, 500);
+  const slaDue = (toLocalDateInput(caseItem.sla_due_at) || caseItem.sla_due_at).slice(0, 64);
+
+  const batch = writeBatch(db);
+  batch.set(escRef, {
+    id: escRef.id,
+    case_id: caseItem.id,
+    case_no: caseItem.case_no.slice(0, MAX_CASE_LINK_LENGTH),
+    shop_id: caseItem.shop_id.slice(0, 64),
+    issue_summary: caseItem.issue_summary.slice(0, 300),
+    details_preview: caseItem.details.slice(0, 4000),
+    sla_due_at: slaDue,
+    from_user_id: currentUser.uid,
+    from_user_name: currentUser.display_name.slice(0, 120),
+    from_team_id: currentUser.team_id,
+    from_team_name: currentUser.team_name.slice(0, 80),
+    to_user_id: targetUser.uid,
+    to_user_name: targetUser.display_name.slice(0, 120),
+    to_team_id: targetUser.team_id,
+    to_team_name: targetUser.team_name.slice(0, 80),
+    note: cleanNote,
+    status: 'pending',
+    reject_reason: '',
+    sender_ack_done: false,
+    created_at: serverTimestamp(),
+    updated_at: serverTimestamp(),
+  });
+
+  batch.set(escLogRef, {
+    id: escRef.id,
+    case_id: caseItem.id,
+    from_user_id: currentUser.uid,
+    from_user_name: currentUser.display_name.slice(0, 120),
+    from_team_id: currentUser.team_id,
+    from_team_name: currentUser.team_name.slice(0, 80),
+    to_user_id: targetUser.uid,
+    to_user_name: targetUser.display_name.slice(0, 120),
+    to_team_id: targetUser.team_id,
+    to_team_name: targetUser.team_name.slice(0, 80),
+    note: cleanNote,
+    status: 'pending',
+    reject_reason: '',
+    created_at: serverTimestamp(),
+    updated_at: serverTimestamp(),
+  });
+
+  batch.update(caseRef, {
+    pending_escalation_id: escRef.id,
+    updated_at: serverTimestamp(),
+  });
+
+  await batch
+    .commit()
+    .catch((err) => handleFirestoreError(err, OperationType.WRITE, `case_escalations/${escRef.id}`));
+}
+
+export async function acceptCaseEscalationDoc(esc: CaseEscalation): Promise<void> {
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'case_escalations', esc.id), {
+    status: 'accepted',
+    sender_ack_done: true,
+    updated_at: serverTimestamp(),
+  });
+  batch.update(doc(db, 'cases', esc.case_id, 'escalation_logs', esc.id), {
+    status: 'accepted',
+    reject_reason: '',
+    updated_at: serverTimestamp(),
+  });
+  batch.update(doc(db, 'cases', esc.case_id), {
+    team_id: esc.to_team_id,
+    team_name: esc.to_team_name.slice(0, 80),
+    assignee_id: esc.to_user_id,
+    assignee_name: esc.to_user_name.slice(0, 120),
+    pending_escalation_id: '',
+    updated_at: serverTimestamp(),
+  });
+
+  await batch
+    .commit()
+    .catch((err) => handleFirestoreError(err, OperationType.UPDATE, `case_escalations/${esc.id}`));
+}
+
+export async function rejectCaseEscalationDoc(
+  esc: CaseEscalation,
+  rejectReason: string
+): Promise<void> {
+  const cleanReason = rejectReason.trim().slice(0, 500);
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'case_escalations', esc.id), {
+    status: 'rejected',
+    reject_reason: cleanReason,
+    sender_ack_done: false,
+    updated_at: serverTimestamp(),
+  });
+  batch.update(doc(db, 'cases', esc.case_id, 'escalation_logs', esc.id), {
+    status: 'rejected',
+    reject_reason: cleanReason,
+    updated_at: serverTimestamp(),
+  });
+  batch.update(doc(db, 'cases', esc.case_id), {
+    pending_escalation_id: '',
+    updated_at: serverTimestamp(),
+  });
+
+  await batch
+    .commit()
+    .catch((err) => handleFirestoreError(err, OperationType.UPDATE, `case_escalations/${esc.id}`));
+}
+
+export async function acknowledgeRejectedEscalationDoc(esc: CaseEscalation): Promise<void> {
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'case_escalations', esc.id), {
+    sender_ack_done: true,
+    updated_at: serverTimestamp(),
+  });
+  batch.update(doc(db, 'cases', esc.case_id, 'escalation_logs', esc.id), {
+    sender_ack_done: true,
+    sender_ack_at: serverTimestamp(),
+  });
+
+  await batch
+    .commit()
+    .catch((err) => handleFirestoreError(err, OperationType.UPDATE, `case_escalations/${esc.id}`));
 }
 
 // ==================== ADMIN MUTATIONS ====================
@@ -1335,4 +2012,108 @@ export async function deletePositionDoc(pos: Position, staffList: StaffEntry[]):
   await deleteDoc(doc(db, 'positions', pos.id)).catch((err) =>
     handleFirestoreError(err, OperationType.DELETE, `positions/${pos.id}`)
   );
+}
+
+// ==================== GOOGLE SHEETS BACKUP SNAPSHOT ====================
+
+export async function fetchCaseBackupSnapshot(cases: CaseItem[]): Promise<CaseBackupSnapshot> {
+  const notesByCase: Record<string, InternalNote[]> = {};
+  const editLogsByCase: Record<string, InternalNoteEditLog[]> = {};
+  const acksByCase: Record<string, AckHistoryEntry[]> = {};
+  const escalationLogsByCase: Record<string, CaseEscalationLog[]> = {};
+
+  let totalNotes = 0;
+  let totalHistoryEvents = 0;
+
+  // Fetch per-case subcollections in bounded batches to avoid connection spikes
+  const CHUNK_SIZE = 6;
+  for (let i = 0; i < cases.length; i += CHUNK_SIZE) {
+    const slice = cases.slice(i, i + CHUNK_SIZE);
+    await Promise.all(
+      slice.map(async (c) => {
+        const [notesSnap, acks, escLogsSnap] = await Promise.all([
+          getDocs(
+            query(collection(db, 'cases', c.id, 'internal_notes'), where('case_id', '==', c.id))
+          ).catch((err) =>
+            handleFirestoreError(err, OperationType.LIST, `cases/${c.id}/internal_notes`)
+          ),
+          fetchCaseAckHistory(c.id),
+          getDocs(
+            query(collection(db, 'cases', c.id, 'escalation_logs'), where('case_id', '==', c.id))
+          ).catch((err) =>
+            handleFirestoreError(err, OperationType.LIST, `cases/${c.id}/escalation_logs`)
+          ),
+        ]);
+
+        const notes: InternalNote[] = notesSnap.docs.map((d) => {
+          const data = d.data();
+          return {
+            id: d.id,
+            case_id: String(data.case_id ?? c.id),
+            author_id: String(data.author_id ?? ''),
+            author_name: String(data.author_name ?? ''),
+            author_role: (data.author_role as RoleLevel) ?? 'agent',
+            content: String(data.content ?? ''),
+            sla_changed: Boolean(data.sla_changed),
+            previous_sla_due_at: String(data.previous_sla_due_at ?? ''),
+            new_sla_due_at: String(data.new_sla_due_at ?? ''),
+            attachments: sanitizeAttachments(data.attachments),
+            is_edited: Boolean(data.is_edited),
+            last_edited_by: String(data.last_edited_by ?? ''),
+            last_edited_by_name: String(data.last_edited_by_name ?? ''),
+            last_edit_log_id: String(data.last_edit_log_id ?? ''),
+            created_at: timestampToIso(data.created_at),
+            updated_at: timestampToIso(data.updated_at),
+          };
+        });
+        notes.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+        const editedNotes = notes.filter((n) => n.is_edited);
+        const editLogArrays = await Promise.all(
+          editedNotes.map((n) => fetchInternalNoteEditLogs(c.id, n.id).catch(() => []))
+        );
+        const editLogs = editLogArrays.flat();
+
+        const escLogs: CaseEscalationLog[] = escLogsSnap.docs.map((d) => {
+          const data = d.data();
+          return {
+            id: d.id,
+            case_id: String(data.case_id ?? c.id),
+            from_user_id: String(data.from_user_id ?? ''),
+            from_user_name: String(data.from_user_name ?? ''),
+            from_team_id: String(data.from_team_id ?? ''),
+            from_team_name: String(data.from_team_name ?? ''),
+            to_user_id: String(data.to_user_id ?? ''),
+            to_user_name: String(data.to_user_name ?? ''),
+            to_team_id: String(data.to_team_id ?? ''),
+            to_team_name: String(data.to_team_name ?? ''),
+            note: String(data.note ?? ''),
+            status: (data.status as EscalationStatus) ?? 'pending',
+            reject_reason: String(data.reject_reason ?? ''),
+            sender_ack_done: Boolean(data.sender_ack_done),
+            sender_ack_at: data.sender_ack_at ? timestampToIso(data.sender_ack_at) : '',
+            created_at: timestampToIso(data.created_at),
+            updated_at: timestampToIso(data.updated_at),
+          };
+        });
+
+        notesByCase[c.id] = notes;
+        editLogsByCase[c.id] = editLogs;
+        acksByCase[c.id] = acks;
+        escalationLogsByCase[c.id] = escLogs;
+
+        totalNotes += notes.length;
+        totalHistoryEvents += acks.length + editLogs.length + escLogs.length;
+      })
+    );
+  }
+
+  return {
+    notesByCase,
+    editLogsByCase,
+    acksByCase,
+    escalationLogsByCase,
+    totalNotes,
+    totalHistoryEvents,
+  };
 }

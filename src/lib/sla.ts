@@ -1,38 +1,45 @@
 import type { AlertStage, CaseItem, CaseStatus, RoleLevel, SlaState } from '../types.ts';
 
-export const PRE_ALERT_WINDOW_MS = 30 * 60 * 1000;
-
-export function computeLiveSlaState(slaDueAtIso: string, status: CaseStatus, nowMs: number): SlaState {
-  if (status === 'done') return 'resolved';
-  const dueMs = new Date(slaDueAtIso).getTime();
-  if (Number.isNaN(dueMs)) return 'normal';
-  const diff = dueMs - nowMs;
-  if (diff < 0) return 'overdue';
-
-  const nowDate = new Date(nowMs);
-  const dueDate = new Date(dueMs);
-  const sameDay =
-    nowDate.getFullYear() === dueDate.getFullYear() &&
-    nowDate.getMonth() === dueDate.getMonth() &&
-    nowDate.getDate() === dueDate.getDate();
-
-  if (diff <= 24 * 60 * 60 * 1000 || sameDay) {
-    return 'due_today';
+export function toLocalDateInput(value: string | number | Date): string {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
   }
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function parseLocalMidnightMs(dateStr: string): number {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  if (!y || !m || !d) return Number.NaN;
+  return new Date(y, m - 1, d).getTime();
+}
+
+export function computeLiveSlaState(slaDueAt: string, status: CaseStatus, nowMs: number): SlaState {
+  if (status === 'done') return 'resolved';
+  const dueDateStr = toLocalDateInput(slaDueAt);
+  if (!dueDateStr) return 'normal';
+  const todayStr = toLocalDateInput(nowMs);
+  if (dueDateStr < todayStr) return 'overdue';
+  if (dueDateStr === todayStr) return 'due_today';
   return 'normal';
 }
 
 export function computeAlertStage(
-  slaDueAtIso: string,
+  slaDueAt: string,
   status: CaseStatus,
   nowMs: number
 ): AlertStage | null {
   if (status === 'done') return null;
-  const dueMs = new Date(slaDueAtIso).getTime();
-  if (Number.isNaN(dueMs)) return null;
-  const diff = dueMs - nowMs;
-  if (diff <= 0) return 'due_reached';
-  if (diff <= PRE_ALERT_WINDOW_MS) return 'pre_30m';
+  const dueDateStr = toLocalDateInput(slaDueAt);
+  if (!dueDateStr) return null;
+  const todayStr = toLocalDateInput(nowMs);
+  if (dueDateStr < todayStr) return 'overdue';
+  if (dueDateStr === todayStr) return 'due_today';
   return null;
 }
 
@@ -40,10 +47,30 @@ export function needsUserAck(item: CaseItem, nowMs: number): boolean {
   const stage = computeAlertStage(item.sla_due_at, item.status, nowMs);
   if (!stage) return false;
   const acked = item.my_ack_stages ?? [];
-  if (stage === 'pre_30m') {
-    return !acked.includes('pre_30m') && !acked.includes('due_reached');
+  if (stage === 'due_today') {
+    return (
+      !acked.includes('due_today') &&
+      !acked.includes('overdue') &&
+      !acked.includes('due_reached')
+    );
   }
-  return !acked.includes('due_reached');
+  if (stage === 'overdue') {
+    return !acked.includes('overdue') && !acked.includes('due_reached');
+  }
+  return false;
+}
+
+export function formatThaiDate(value: string | null | undefined): string {
+  if (!value) return '-';
+  const dateStr = toLocalDateInput(value);
+  if (!dateStr) return '-';
+  const ms = parseLocalMidnightMs(dateStr);
+  if (Number.isNaN(ms)) return '-';
+  return new Date(ms).toLocaleDateString('th-TH', {
+    day: '2-digit',
+    month: 'short',
+    year: '2-digit',
+  });
 }
 
 export function formatThaiDateTime(iso: string | null | undefined): string {
@@ -59,30 +86,24 @@ export function formatThaiDateTime(iso: string | null | undefined): string {
   });
 }
 
-export function formatDurationThai(msAbs: number): string {
-  const totalMinutes = Math.max(1, Math.floor(msAbs / 60000));
-  const days = Math.floor(totalMinutes / (60 * 24));
-  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
-  const minutes = totalMinutes % 60;
-
-  if (days > 0) {
-    return hours > 0 ? `${days} วัน ${hours} ชม.` : `${days} วัน`;
-  }
-  if (hours > 0) {
-    return minutes > 0 ? `${hours} ชม. ${minutes} น.` : `${hours} ชม.`;
-  }
-  return `${minutes} นาที`;
-}
-
-export function formatSlaCountdown(slaDueAtIso: string, status: CaseStatus, nowMs: number): string {
+export function formatSlaCountdown(slaDueAt: string, status: CaseStatus, nowMs: number): string {
   if (status === 'done') return 'ปิดเคสแล้ว';
-  const dueMs = new Date(slaDueAtIso).getTime();
-  if (Number.isNaN(dueMs)) return '-';
-  const diff = dueMs - nowMs;
-  if (diff < 0) {
-    return `เกิน SLA ${formatDurationThai(Math.abs(diff))}`;
+  const dueDateStr = toLocalDateInput(slaDueAt);
+  const todayStr = toLocalDateInput(nowMs);
+  if (!dueDateStr || !todayStr) return '-';
+  const dueMidnight = parseLocalMidnightMs(dueDateStr);
+  const todayMidnight = parseLocalMidnightMs(todayStr);
+  const diffDays = Math.round((dueMidnight - todayMidnight) / (24 * 60 * 60 * 1000));
+  if (diffDays < 0) {
+    return `เกินกำหนด ${Math.abs(diffDays)} วัน`;
   }
-  return `เหลือ ${formatDurationThai(diff)}`;
+  if (diffDays === 0) {
+    return 'ครบกำหนดวันนี้';
+  }
+  if (diffDays === 1) {
+    return 'ครบกำหนดพรุ่งนี้';
+  }
+  return `อีก ${diffDays} วัน`;
 }
 
 export function getStatusLabel(status: CaseStatus): string {
@@ -118,11 +139,4 @@ export function getRoleLabel(role: RoleLevel): string {
     case 'agent':
       return 'Agent (เจ้าหน้าที่)';
   }
-}
-
-export function toLocalDateTimeInput(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }

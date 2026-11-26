@@ -80,3 +80,73 @@ export async function playBellChime(isOverdue = false): Promise<boolean> {
 
   return true;
 }
+
+function triggerSynthTone(
+  ctx: AudioContext,
+  startTime: number,
+  freq: number,
+  duration: number,
+  peakGain: number,
+  type: OscillatorType = 'triangle'
+): void {
+  const osc = ctx.createOscillator();
+  const gainNode = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, startTime);
+
+  gainNode.gain.setValueAtTime(0.0001, startTime);
+  gainNode.gain.linearRampToValueAtTime(peakGain, startTime + 0.015);
+  gainNode.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+
+  osc.connect(gainNode);
+  gainNode.connect(ctx.destination);
+
+  osc.start(startTime);
+  osc.stop(startTime + duration + 0.04);
+}
+
+/**
+ * Distinct ascending electronic chime for incoming Escalate handoff alerts
+ * (clearly different from the metallic SLA overdue bell).
+ */
+export async function playEscalationIncomingChime(): Promise<boolean> {
+  const ctx = getAudioContext();
+  if (!ctx) return false;
+  if (ctx.state === 'suspended') {
+    try {
+      await ctx.resume();
+    } catch {
+      return false;
+    }
+  }
+  if (ctx.state !== 'running') return false;
+
+  const now = ctx.currentTime;
+  triggerSynthTone(ctx, now + 0.01, 523.25, 0.22, 0.2, 'triangle'); // C5
+  triggerSynthTone(ctx, now + 0.14, 659.25, 0.22, 0.2, 'triangle'); // E5
+  triggerSynthTone(ctx, now + 0.27, 783.99, 0.24, 0.22, 'triangle'); // G5
+  triggerSynthTone(ctx, now + 0.41, 1046.5, 0.42, 0.24, 'triangle'); // C6
+  return true;
+}
+
+/**
+ * Distinct descending return tone when an escalated case is rejected back to sender.
+ */
+export async function playEscalationRejectedChime(): Promise<boolean> {
+  const ctx = getAudioContext();
+  if (!ctx) return false;
+  if (ctx.state === 'suspended') {
+    try {
+      await ctx.resume();
+    } catch {
+      return false;
+    }
+  }
+  if (ctx.state !== 'running') return false;
+
+  const now = ctx.currentTime;
+  triggerSynthTone(ctx, now + 0.01, 698.46, 0.24, 0.2, 'triangle'); // F5
+  triggerSynthTone(ctx, now + 0.2, 587.33, 0.24, 0.2, 'triangle'); // D5
+  triggerSynthTone(ctx, now + 0.4, 440.0, 0.42, 0.22, 'triangle'); // A4
+  return true;
+}

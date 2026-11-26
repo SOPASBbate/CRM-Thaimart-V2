@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { AlertTriangle, Bell, Check, Clock, ExternalLink, Volume2, VolumeX, X } from 'lucide-react';
 import { playBellChime, unlockAudio } from '../lib/bell.ts';
-import { computeAlertStage, formatSlaCountdown, formatThaiDateTime } from '../lib/sla.ts';
+import { getSafeCaseUrl } from '../lib/caseLink.ts';
+import { computeAlertStage, formatSlaCountdown, formatThaiDate } from '../lib/sla.ts';
 import type { CaseItem } from '../types.ts';
 
 interface SlaAlertModalProps {
@@ -30,13 +31,13 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
   const [muted, setMuted] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
 
-  const dueReachedList = alerts.filter(
-    (c) => computeAlertStage(c.sla_due_at, c.status, nowMs) === 'due_reached'
+  const overdueList = alerts.filter(
+    (c) => computeAlertStage(c.sla_due_at, c.status, nowMs) === 'overdue'
   );
-  const pre30mList = alerts.filter(
-    (c) => computeAlertStage(c.sla_due_at, c.status, nowMs) === 'pre_30m'
+  const dueTodayList = alerts.filter(
+    (c) => computeAlertStage(c.sla_due_at, c.status, nowMs) === 'due_today'
   );
-  const hasDueReached = dueReachedList.length > 0;
+  const hasOverdue = overdueList.length > 0;
 
   // Unmute automatically whenever the popup opens or a repeat notification fires
   useEffect(() => {
@@ -55,7 +56,7 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
 
     const ringOnce = async () => {
       if (cancelled) return;
-      const played = await playBellChime(hasDueReached);
+      const played = await playBellChime(hasOverdue);
       if (!cancelled) {
         setAudioBlocked(!played);
       }
@@ -70,7 +71,7 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
       cancelled = true;
       clearInterval(intervalId);
     };
-  }, [open, alerts.length, muted, hasDueReached]);
+  }, [open, alerts.length, muted, hasOverdue]);
 
   if (!open || alerts.length === 0) return null;
 
@@ -80,7 +81,7 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
       setAudioBlocked(!ok);
       setMuted(false);
       if (ok) {
-        void playBellChime(hasDueReached);
+        void playBellChime(hasOverdue);
       }
       return;
     }
@@ -129,9 +130,19 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
               <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                 <div className="space-y-1 min-w-0">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
-                    <span className="font-mono font-semibold text-slate-900 tabular-nums">{item.case_no}</span>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-mono text-slate-700 tabular-nums">SHOP {item.shop_id}</span>
+                    {getSafeCaseUrl(item.case_no) ? (
+                      <a
+                        href={getSafeCaseUrl(item.case_no)!}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 font-semibold text-blue-700 hover:text-blue-900 hover:underline"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                        <span>ลิงก์ไปที่เคส</span>
+                      </a>
+                    ) : (
+                      <span className="font-mono font-semibold text-slate-900 tabular-nums">{item.case_no}</span>
+                    )}
                     <span aria-hidden="true">·</span>
                     <span className="text-slate-700">{item.team_name}</span>
                     <span aria-hidden="true">·</span>
@@ -144,7 +155,7 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
                     </span>
                     <span className="text-slate-400" aria-hidden="true">·</span>
                     <span className="text-slate-500 tabular-nums">
-                      ครบกำหนด: {formatThaiDateTime(item.sla_due_at)}
+                      วันครบกำหนด: {formatThaiDate(item.sla_due_at)}
                     </span>
                   </div>
                 </div>
@@ -209,7 +220,7 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
                 แจ้งเตือน SLA ({alerts.length} รายการ)
               </h2>
               <p className="text-xs text-slate-500">
-                แจ้งเตือนก่อนครบกำหนด 30 นาที และเมื่อถึงกำหนด — หยุดแจ้งเตือนเฉพาะผู้ที่กดรับทราบแล้ว
+                แจ้งเตือนเฉพาะวันที่ครบกำหนดและเกินวัน — หยุดแจ้งเตือนเฉพาะผู้ที่กดรับทราบแล้ว
               </p>
             </div>
           </div>
@@ -252,8 +263,8 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          {renderGroup('ถึงกำหนด / เกินเวลา SLA แล้ว (แจ้งเตือนครั้งที่ 2)', dueReachedList, true)}
-          {renderGroup('ใกล้ถึงกำหนด SLA ภายใน 30 นาที (แจ้งเตือนล่วงหน้า)', pre30mList, false)}
+          {renderGroup('เกินวันครบกำหนด SLA แล้ว', overdueList, true)}
+          {renderGroup('ถึงวันครบกำหนด SLA วันนี้', dueTodayList, false)}
         </div>
 
         <div className="bg-white border-t border-slate-200 px-6 py-4 flex flex-wrap items-center justify-between gap-3">

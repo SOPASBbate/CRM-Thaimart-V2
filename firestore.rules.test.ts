@@ -20,5 +20,15 @@ assert.match(rulesSource, /allow list: if isSignedIn\(\) && isAdmin\(\);/);
 assert.match(rulesSource, /match \/case_acks\/\{ackId\}/);
 assert.match(rulesSource, /match \/system_config\/\{docId\}/);
 assert.match(rulesSource, /existsAfter\(\/databases\/\$\(database\)\/documents\/system_config\/bootstrap\)/);
+assert.match(rulesSource, /match \/internal_notes\/\{noteId\}/);
+assert.match(rulesSource, /match \/edit_logs\/\{logId\}/);
+assert.match(rulesSource, /isValidInternalNote\(/);
+assert.match(rulesSource, /isValidInternalNoteEditLog\(/);
+assert.match(rulesSource, /allow delete: if isAdmin\(\) && isValidId\(caseId\);/);
+assert.match(rulesSource, /allow delete: if isAdmin\(\) && isValidId\(caseId\) && isValidId\(noteId\);/);
+assert.match(rulesSource, /match \/case_escalations\/\{escalationId\}/);
+assert.match(rulesSource, /match \/escalation_logs\/\{logId\}/);
+assert.match(rulesSource, /isValidCaseEscalation\(/);
+assert.match(rulesSource, /isValidCaseEscalationLog\(/);
 
 console.log('Verified all Firestore security rule invariants in firestore.rules.');

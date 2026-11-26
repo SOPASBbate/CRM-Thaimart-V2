@@ -65,11 +65,15 @@ service cloud.firestore {
     }
 
     function isValidAckStage(stage) {
-      return stage in ['pre_30m', 'due_reached'];
+      return stage in ['pre_30m', 'due_reached', 'due_today', 'overdue'];
     }
 
     function isValidAckLevel(level) {
       return level in ['', 'pre_30m', 'due_reached', 'due_today', 'overdue'];
+    }
+
+    function isValidEscalationStatus(status) {
+      return status in ['pending', 'accepted', 'rejected'];
     }
 
     // ==================== VALIDATION BLUEPRINTS ====================
@@ -198,12 +202,12 @@ service cloud.firestore {
           'id', 'case_no', 'shop_id', 'issue_summary', 'details', 'status',
           'team_id', 'team_name', 'assignee_id', 'assignee_name', 'created_by',
           'sla_due_at', 'last_ack_at', 'last_ack_by', 'last_ack_by_name',
-          'last_ack_level', 'resolved_at', 'created_at', 'updated_at'
+          'last_ack_level', 'resolved_at', 'pending_escalation_id', 'created_at', 'updated_at'
         ]) &&
         isValidId(data.id) &&
         data.id == docId &&
-        data.case_no is string && data.case_no.size() >= 1 && data.case_no.size() <= 64 &&
-        data.shop_id is string && data.shop_id.size() >= 1 && data.shop_id.size() <= 64 &&
+        data.case_no is string && data.case_no.size() >= 1 && data.case_no.size() <= 1000 &&
+        data.shop_id is string && data.shop_id.size() <= 64 &&
         data.issue_summary is string && data.issue_summary.size() >= 1 && data.issue_summary.size() <= 300 &&
         data.details is string && data.details.size() <= 4000 &&
         isValidCaseStatus(data.status) &&
@@ -218,6 +222,7 @@ service cloud.firestore {
         data.last_ack_by_name is string && data.last_ack_by_name.size() <= 120 &&
         isValidAckLevel(data.last_ack_level) &&
         data.resolved_at is string && data.resolved_at.size() <= 64 &&
+        (!('pending_escalation_id' in data) || (data.pending_escalation_id is string && data.pending_escalation_id.size() <= 128)) &&
         data.created_at is timestamp &&
         data.updated_at is timestamp;
     }
@@ -235,6 +240,178 @@ service cloud.firestore {
         data.ack_level in ['pre_30m', 'due_reached', 'due_today', 'overdue'] &&
         data.note is string && data.note.size() <= 500 &&
         data.ack_at is timestamp;
+    }
+
+    function isValidAttachmentItem(item) {
+      return item is map &&
+        item.keys().hasAll(['id', 'name', 'mime_type', 'size_bytes', 'kind', 'url']) &&
+        item.keys().hasOnly(['id', 'name', 'mime_type', 'size_bytes', 'kind', 'url']) &&
+        isValidId(item.id) &&
+        item.name is string && item.name.size() >= 1 && item.name.size() <= 255 &&
+        item.mime_type is string && item.mime_type.size() >= 1 && item.mime_type.size() <= 128 &&
+        item.size_bytes is int && item.size_bytes >= 0 && item.size_bytes <= 52428800 &&
+        item.kind in ['image', 'video', 'file'] &&
+        item.url is string && item.url.size() >= 1 && item.url.size() <= 1024;
+    }
+
+    function isValidAttachmentsList(list) {
+      return list is list &&
+        list.size() <= 5 &&
+        (list.size() < 1 || isValidAttachmentItem(list[0])) &&
+        (list.size() < 2 || isValidAttachmentItem(list[1])) &&
+        (list.size() < 3 || isValidAttachmentItem(list[2])) &&
+        (list.size() < 4 || isValidAttachmentItem(list[3])) &&
+        (list.size() < 5 || isValidAttachmentItem(list[4]));
+    }
+
+    function isValidInternalNote(data, docId, caseId) {
+      return data.keys().hasAll([
+          'id', 'case_id', 'author_id', 'author_name', 'author_role',
+          'content', 'sla_changed', 'previous_sla_due_at', 'new_sla_due_at',
+          'is_edited', 'last_edited_by', 'last_edited_by_name', 'last_edit_log_id',
+          'created_at', 'updated_at'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'case_id', 'author_id', 'author_name', 'author_role',
+          'content', 'sla_changed', 'previous_sla_due_at', 'new_sla_due_at',
+          'attachments',
+          'is_edited', 'last_edited_by', 'last_edited_by_name', 'last_edit_log_id',
+          'created_at', 'updated_at'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == docId &&
+        isValidId(data.case_id) &&
+        data.case_id == caseId &&
+        isValidId(data.author_id) &&
+        data.author_name is string && data.author_name.size() >= 1 && data.author_name.size() <= 120 &&
+        isValidRole(data.author_role) &&
+        data.content is string && data.content.size() <= 2000 &&
+        (data.content.size() >= 1 || ('attachments' in data && data.attachments is list && data.attachments.size() >= 1)) &&
+        (!('attachments' in data) || isValidAttachmentsList(data.attachments)) &&
+        data.sla_changed is bool &&
+        data.previous_sla_due_at is string && data.previous_sla_due_at.size() <= 64 &&
+        data.new_sla_due_at is string && data.new_sla_due_at.size() <= 64 &&
+        (!data.sla_changed || (data.previous_sla_due_at.size() >= 10 && data.new_sla_due_at.size() >= 10)) &&
+        data.is_edited is bool &&
+        data.last_edited_by is string && data.last_edited_by.size() <= 128 &&
+        data.last_edited_by_name is string && data.last_edited_by_name.size() <= 120 &&
+        data.last_edit_log_id is string && data.last_edit_log_id.size() <= 128 &&
+        data.created_at is timestamp &&
+        data.updated_at is timestamp;
+    }
+
+    function isValidInternalNoteEditLog(data, docId, caseId, noteId) {
+      return data.keys().hasAll([
+          'id', 'note_id', 'case_id', 'editor_id', 'editor_name', 'editor_role',
+          'old_content', 'new_content', 'old_sla_due_at', 'new_sla_due_at', 'edited_at'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'note_id', 'case_id', 'editor_id', 'editor_name', 'editor_role',
+          'old_content', 'new_content', 'old_sla_due_at', 'new_sla_due_at',
+          'old_attachments_summary', 'new_attachments_summary', 'edited_at'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == docId &&
+        isValidId(data.note_id) &&
+        data.note_id == noteId &&
+        isValidId(data.case_id) &&
+        data.case_id == caseId &&
+        isValidId(data.editor_id) &&
+        data.editor_name is string && data.editor_name.size() >= 1 && data.editor_name.size() <= 120 &&
+        isValidRole(data.editor_role) &&
+        data.old_content is string && data.old_content.size() <= 2000 &&
+        data.new_content is string && data.new_content.size() <= 2000 &&
+        data.old_sla_due_at is string && data.old_sla_due_at.size() <= 64 &&
+        data.new_sla_due_at is string && data.new_sla_due_at.size() <= 64 &&
+        (!('old_attachments_summary' in data) || (data.old_attachments_summary is string && data.old_attachments_summary.size() <= 1000)) &&
+        (!('new_attachments_summary' in data) || (data.new_attachments_summary is string && data.new_attachments_summary.size() <= 1000)) &&
+        data.edited_at is timestamp;
+    }
+
+    function isValidCaseEscalation(data, docId) {
+      return data.keys().hasAll([
+          'id', 'case_id', 'case_no', 'shop_id', 'issue_summary', 'details_preview', 'sla_due_at',
+          'from_user_id', 'from_user_name', 'from_team_id', 'from_team_name',
+          'to_user_id', 'to_user_name', 'to_team_id', 'to_team_name',
+          'note', 'status', 'reject_reason', 'sender_ack_done', 'created_at', 'updated_at'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'case_id', 'case_no', 'shop_id', 'issue_summary', 'details_preview', 'sla_due_at',
+          'from_user_id', 'from_user_name', 'from_team_id', 'from_team_name',
+          'to_user_id', 'to_user_name', 'to_team_id', 'to_team_name',
+          'note', 'status', 'reject_reason', 'sender_ack_done', 'created_at', 'updated_at'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == docId &&
+        isValidId(data.case_id) &&
+        data.case_no is string && data.case_no.size() >= 1 && data.case_no.size() <= 1000 &&
+        data.shop_id is string && data.shop_id.size() <= 64 &&
+        data.issue_summary is string && data.issue_summary.size() >= 1 && data.issue_summary.size() <= 300 &&
+        data.details_preview is string && data.details_preview.size() <= 4000 &&
+        data.sla_due_at is string && data.sla_due_at.size() >= 10 && data.sla_due_at.size() <= 64 &&
+        isValidId(data.from_user_id) &&
+        data.from_user_name is string && data.from_user_name.size() >= 1 && data.from_user_name.size() <= 120 &&
+        isValidId(data.from_team_id) &&
+        data.from_team_name is string && data.from_team_name.size() >= 1 && data.from_team_name.size() <= 80 &&
+        isValidId(data.to_user_id) &&
+        data.to_user_name is string && data.to_user_name.size() >= 1 && data.to_user_name.size() <= 120 &&
+        isValidId(data.to_team_id) &&
+        data.to_team_name is string && data.to_team_name.size() >= 1 && data.to_team_name.size() <= 80 &&
+        data.note is string && data.note.size() <= 500 &&
+        isValidEscalationStatus(data.status) &&
+        data.reject_reason is string && data.reject_reason.size() <= 500 &&
+        data.sender_ack_done is bool &&
+        data.created_at is timestamp &&
+        data.updated_at is timestamp;
+    }
+
+    function isValidCaseEscalationLog(data, docId, caseId) {
+      return data.keys().hasAll([
+          'id', 'case_id',
+          'from_user_id', 'from_user_name', 'from_team_id', 'from_team_name',
+          'to_user_id', 'to_user_name', 'to_team_id', 'to_team_name',
+          'note', 'status', 'reject_reason', 'created_at', 'updated_at'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'case_id',
+          'from_user_id', 'from_user_name', 'from_team_id', 'from_team_name',
+          'to_user_id', 'to_user_name', 'to_team_id', 'to_team_name',
+          'note', 'status', 'reject_reason', 'sender_ack_done', 'sender_ack_at', 'created_at', 'updated_at'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == docId &&
+        isValidId(data.case_id) &&
+        data.case_id == caseId &&
+        isValidId(data.from_user_id) &&
+        data.from_user_name is string && data.from_user_name.size() >= 1 && data.from_user_name.size() <= 120 &&
+        isValidId(data.from_team_id) &&
+        data.from_team_name is string && data.from_team_name.size() >= 1 && data.from_team_name.size() <= 80 &&
+        isValidId(data.to_user_id) &&
+        data.to_user_name is string && data.to_user_name.size() >= 1 && data.to_user_name.size() <= 120 &&
+        isValidId(data.to_team_id) &&
+        data.to_team_name is string && data.to_team_name.size() >= 1 && data.to_team_name.size() <= 80 &&
+        data.note is string && data.note.size() <= 500 &&
+        isValidEscalationStatus(data.status) &&
+        data.reject_reason is string && data.reject_reason.size() <= 500 &&
+        (!('sender_ack_done' in data) || data.sender_ack_done is bool) &&
+        (!('sender_ack_at' in data) || data.sender_ack_at is timestamp) &&
+        data.created_at is timestamp &&
+        data.updated_at is timestamp;
+    }
+
+    function isValidAcceptEsc(esc, caseId) {
+      return esc.status == 'pending' &&
+        esc.case_id == caseId &&
+        esc.to_user_id == request.auth.uid &&
+        incoming().team_id == esc.to_team_id &&
+        incoming().team_name == esc.to_team_name &&
+        incoming().assignee_id == request.auth.uid;
+    }
+
+    function isValidRejectEsc(esc, caseId) {
+      return esc.status == 'pending' &&
+        esc.case_id == caseId &&
+        esc.to_user_id == request.auth.uid;
     }
 
     // ==================== COLLECTION RULES ====================
@@ -454,6 +631,85 @@ service cloud.firestore {
       }
     }
 
+    // Cross-user case escalation notifications & accept/reject queue
+    match /case_escalations/{escalationId} {
+      allow get: if isActiveUser() && isValidId(escalationId) &&
+        (isAdmin() || isTL() || existing().to_user_id == request.auth.uid || existing().from_user_id == request.auth.uid);
+      allow list: if isActiveUser() &&
+        (isAdmin() || isTL() || existing().to_user_id == request.auth.uid || existing().from_user_id == request.auth.uid);
+      allow create: if isActiveUser() && isValidId(escalationId) &&
+        isValidCaseEscalation(incoming(), escalationId) &&
+        incoming().from_user_id == request.auth.uid &&
+        incoming().to_user_id != request.auth.uid &&
+        incoming().status == 'pending' &&
+        incoming().reject_reason == '' &&
+        incoming().sender_ack_done == false &&
+        incoming().created_at == request.time &&
+        incoming().updated_at == request.time &&
+        exists(/databases/$(database)/documents/cases/$(incoming().case_id)) &&
+        exists(/databases/$(database)/documents/users/$(incoming().to_user_id)) &&
+        get(/databases/$(database)/documents/users/$(incoming().to_user_id)).data.is_active == true &&
+        (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(incoming().case_id)).data.team_id == userDoc().team_id) &&
+        getAfter(/databases/$(database)/documents/cases/$(incoming().case_id)).data.pending_escalation_id == escalationId &&
+        existsAfter(/databases/$(database)/documents/cases/$(incoming().case_id)/escalation_logs/$(escalationId));
+      allow update: if isActiveUser() && isValidId(escalationId) &&
+        isValidCaseEscalation(incoming(), escalationId) &&
+        incoming().id == existing().id &&
+        incoming().case_id == existing().case_id &&
+        incoming().case_no == existing().case_no &&
+        incoming().shop_id == existing().shop_id &&
+        incoming().issue_summary == existing().issue_summary &&
+        incoming().details_preview == existing().details_preview &&
+        incoming().sla_due_at == existing().sla_due_at &&
+        incoming().from_user_id == existing().from_user_id &&
+        incoming().from_user_name == existing().from_user_name &&
+        incoming().from_team_id == existing().from_team_id &&
+        incoming().from_team_name == existing().from_team_name &&
+        incoming().to_user_id == existing().to_user_id &&
+        incoming().to_user_name == existing().to_user_name &&
+        incoming().to_team_id == existing().to_team_id &&
+        incoming().to_team_name == existing().to_team_name &&
+        incoming().note == existing().note &&
+        incoming().created_at == existing().created_at &&
+        incoming().updated_at == request.time &&
+        (
+          // Recipient Accept
+          (
+            existing().status == 'pending' &&
+            existing().to_user_id == request.auth.uid &&
+            incoming().status == 'accepted' &&
+            incoming().reject_reason == '' &&
+            incoming().sender_ack_done == true &&
+            getAfter(/databases/$(database)/documents/cases/$(existing().case_id)).data.assignee_id == request.auth.uid &&
+            getAfter(/databases/$(database)/documents/cases/$(existing().case_id)).data.pending_escalation_id == '' &&
+            getAfter(/databases/$(database)/documents/cases/$(existing().case_id)/escalation_logs/$(escalationId)).data.status == 'accepted' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'sender_ack_done', 'updated_at'])
+          ) ||
+          // Recipient Reject
+          (
+            existing().status == 'pending' &&
+            existing().to_user_id == request.auth.uid &&
+            incoming().status == 'rejected' &&
+            incoming().sender_ack_done == false &&
+            getAfter(/databases/$(database)/documents/cases/$(existing().case_id)).data.pending_escalation_id == '' &&
+            getAfter(/databases/$(database)/documents/cases/$(existing().case_id)/escalation_logs/$(escalationId)).data.status == 'rejected' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reject_reason', 'sender_ack_done', 'updated_at'])
+          ) ||
+          // Sender Acknowledge Rejection
+          (
+            existing().status == 'rejected' &&
+            existing().from_user_id == request.auth.uid &&
+            existing().sender_ack_done == false &&
+            incoming().status == 'rejected' &&
+            incoming().reject_reason == existing().reject_reason &&
+            incoming().sender_ack_done == true &&
+            getAfter(/databases/$(database)/documents/cases/$(existing().case_id)/escalation_logs/$(escalationId)).data.sender_ack_done == true &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['sender_ack_done', 'updated_at'])
+          )
+        );
+      allow delete: if isAdmin() && isValidId(escalationId);
+    }
+
     // Support cases & SLA tracking
     match /cases/{caseId} {
       allow get: if isActiveUser() && isValidId(caseId) &&
@@ -465,6 +721,7 @@ service cloud.firestore {
         incoming().created_by == request.auth.uid &&
         incoming().assignee_id == request.auth.uid &&
         incoming().team_id == userDoc().team_id &&
+        (!('pending_escalation_id' in incoming()) || incoming().pending_escalation_id == '') &&
         incoming().created_at == request.time &&
         incoming().updated_at == request.time &&
         exists(/databases/$(database)/documents/teams/$(incoming().team_id));
@@ -475,38 +732,80 @@ service cloud.firestore {
         incoming().created_at == existing().created_at &&
         incoming().updated_at == request.time &&
         (
-          // Action 1: Admin or TL full case update & reassignment
+          // Action 1: Admin full case update & reassignment
           (
-            (isAdmin() || isTL()) &&
-            exists(/databases/$(database)/documents/teams/$(incoming().team_id)) &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'case_no', 'shop_id', 'issue_summary', 'details', 'status',
               'team_id', 'team_name', 'assignee_id', 'assignee_name',
               'sla_due_at', 'last_ack_at', 'last_ack_by', 'last_ack_by_name',
-              'last_ack_level', 'resolved_at', 'updated_at'
-            ])
+              'last_ack_level', 'resolved_at', 'pending_escalation_id', 'updated_at'
+            ]) &&
+            isAdmin() &&
+            exists(/databases/$(database)/documents/teams/$(incoming().team_id))
           ) ||
-          // Action 2: Same-team Agent editing case details/status/SLA without transferring team or assignee
+          // Action 2: TL updating status/SLA/reassignment without modifying original case details
           (
-            existing().team_id == userDoc().team_id &&
-            incoming().team_id == existing().team_id &&
-            incoming().assignee_id == existing().assignee_id &&
             incoming().diff(existing()).affectedKeys().hasOnly([
-              'case_no', 'shop_id', 'issue_summary', 'details', 'status',
+              'status', 'team_id', 'team_name', 'assignee_id', 'assignee_name',
               'sla_due_at', 'last_ack_at', 'last_ack_by', 'last_ack_by_name',
               'last_ack_level', 'resolved_at', 'updated_at'
-            ])
+            ]) &&
+            isTL() &&
+            exists(/databases/$(database)/documents/teams/$(incoming().team_id))
           ) ||
-          // Action 3: Recording SLA acknowledgment metadata by an authorized viewer
+          // Action 3: Same-team Agent updating status/SLA without modifying original case details or transferring ownership
           (
-            (isAdmin() || isTL() || existing().team_id == userDoc().team_id) &&
-            incoming().last_ack_by == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'sla_due_at', 'last_ack_at', 'last_ack_by', 'last_ack_by_name',
+              'last_ack_level', 'resolved_at', 'updated_at'
+            ]) &&
+            existing().team_id == userDoc().team_id &&
+            incoming().team_id == existing().team_id &&
+            incoming().assignee_id == existing().assignee_id
+          ) ||
+          // Action 4: Recording SLA acknowledgment metadata by an authorized viewer
+          (
             incoming().diff(existing()).affectedKeys().hasOnly([
               'last_ack_at', 'last_ack_by', 'last_ack_by_name', 'last_ack_level', 'updated_at'
-            ])
+            ]) &&
+            incoming().last_ack_by == request.auth.uid &&
+            (isAdmin() || isTL() || existing().team_id == userDoc().team_id)
+          ) ||
+          // Action 5: Initiating a pending escalation
+          (
+            (!('pending_escalation_id' in existing()) || existing().pending_escalation_id == '') &&
+            isValidId(incoming().pending_escalation_id) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['pending_escalation_id', 'updated_at']) &&
+            (isAdmin() || isTL() || existing().team_id == userDoc().team_id) &&
+            getAfter(/databases/$(database)/documents/case_escalations/$(incoming().pending_escalation_id)).data.status == 'pending' &&
+            getAfter(/databases/$(database)/documents/case_escalations/$(incoming().pending_escalation_id)).data.case_id == caseId &&
+            getAfter(/databases/$(database)/documents/case_escalations/$(incoming().pending_escalation_id)).data.from_user_id == request.auth.uid
+          ) ||
+          // Action 6: Recipient accepting a pending escalation (transfers case ownership)
+          (
+            'pending_escalation_id' in existing() &&
+            isValidId(existing().pending_escalation_id) &&
+            incoming().pending_escalation_id == '' &&
+            incoming().assignee_id == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'team_id', 'team_name', 'assignee_id', 'assignee_name', 'pending_escalation_id', 'updated_at'
+            ]) &&
+            getAfter(/databases/$(database)/documents/case_escalations/$(existing().pending_escalation_id)).data.status == 'accepted' &&
+            exists(/databases/$(database)/documents/case_escalations/$(existing().pending_escalation_id)) &&
+            isValidAcceptEsc(get(/databases/$(database)/documents/case_escalations/$(existing().pending_escalation_id)).data, caseId)
+          ) ||
+          // Action 7: Recipient rejecting a pending escalation (returns case to sender)
+          (
+            'pending_escalation_id' in existing() &&
+            isValidId(existing().pending_escalation_id) &&
+            incoming().pending_escalation_id == '' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['pending_escalation_id', 'updated_at']) &&
+            getAfter(/databases/$(database)/documents/case_escalations/$(existing().pending_escalation_id)).data.status == 'rejected' &&
+            exists(/databases/$(database)/documents/case_escalations/$(existing().pending_escalation_id)) &&
+            isValidRejectEsc(get(/databases/$(database)/documents/case_escalations/$(existing().pending_escalation_id)).data, caseId)
           )
         );
-      allow delete: if (isAdmin() || isTL()) && isValidId(caseId);
+      allow delete: if isAdmin() && isValidId(caseId);
 
       // Case acknowledgment audit trail
       match /acknowledgments/{ackId} {
@@ -519,7 +818,151 @@ service cloud.firestore {
           incoming().ack_at == request.time &&
           exists(/databases/$(database)/documents/cases/$(caseId)) &&
           (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id);
-        allow update, delete: if false;
+        allow update: if false;
+        allow delete: if isAdmin() && isValidId(caseId) && isValidId(ackId);
+      }
+
+      // Case Escalation Audit Logs (per-case history)
+      match /escalation_logs/{logId} {
+        allow get: if isActiveUser() && isValidId(caseId) && isValidId(logId) &&
+          (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id);
+        allow list: if isActiveUser() && existing().case_id == caseId &&
+          (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id);
+        allow create: if isActiveUser() && isValidId(caseId) && isValidId(logId) &&
+          isValidCaseEscalationLog(incoming(), logId, caseId) &&
+          !('sender_ack_done' in incoming()) &&
+          !('sender_ack_at' in incoming()) &&
+          incoming().from_user_id == request.auth.uid &&
+          incoming().status == 'pending' &&
+          incoming().reject_reason == '' &&
+          incoming().created_at == request.time &&
+          incoming().updated_at == request.time &&
+          exists(/databases/$(database)/documents/cases/$(caseId)) &&
+          (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id) &&
+          existsAfter(/databases/$(database)/documents/case_escalations/$(logId));
+        allow update: if isActiveUser() && isValidId(caseId) && isValidId(logId) &&
+          isValidCaseEscalationLog(incoming(), logId, caseId) &&
+          incoming().id == existing().id &&
+          incoming().case_id == existing().case_id &&
+          incoming().from_user_id == existing().from_user_id &&
+          incoming().from_user_name == existing().from_user_name &&
+          incoming().from_team_id == existing().from_team_id &&
+          incoming().from_team_name == existing().from_team_name &&
+          incoming().to_user_id == existing().to_user_id &&
+          incoming().to_user_name == existing().to_user_name &&
+          incoming().to_team_id == existing().to_team_id &&
+          incoming().to_team_name == existing().to_team_name &&
+          incoming().note == existing().note &&
+          incoming().created_at == existing().created_at &&
+          (
+            // Recipient Accept or Reject
+            (
+              existing().status == 'pending' &&
+              existing().to_user_id == request.auth.uid &&
+              incoming().status in ['accepted', 'rejected'] &&
+              incoming().updated_at == request.time &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reject_reason', 'updated_at']) &&
+              getAfter(/databases/$(database)/documents/case_escalations/$(logId)).data.status == incoming().status
+            ) ||
+            // Sender Acknowledge Rejection
+            (
+              existing().status == 'rejected' &&
+              existing().from_user_id == request.auth.uid &&
+              (!('sender_ack_done' in existing()) || existing().sender_ack_done == false) &&
+              incoming().status == 'rejected' &&
+              incoming().reject_reason == existing().reject_reason &&
+              incoming().updated_at == existing().updated_at &&
+              incoming().sender_ack_done == true &&
+              incoming().sender_ack_at == request.time &&
+              incoming().diff(existing()).affectedKeys().hasOnly(['sender_ack_done', 'sender_ack_at']) &&
+              getAfter(/databases/$(database)/documents/case_escalations/$(logId)).data.sender_ack_done == true
+            )
+          );
+        allow delete: if isAdmin() && isValidId(caseId) && isValidId(logId);
+      }
+
+      // Case Internal Notes (Agent & TL can create and edit with audit log; only Admin can delete)
+      match /internal_notes/{noteId} {
+        allow get: if isActiveUser() && isValidId(caseId) && isValidId(noteId) &&
+          (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id);
+        allow list: if isActiveUser() && existing().case_id == caseId &&
+          (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id);
+        allow create: if isActiveUser() && isValidId(caseId) && isValidId(noteId) &&
+          isValidInternalNote(incoming(), noteId, caseId) &&
+          incoming().author_id == request.auth.uid &&
+          incoming().author_role == userDoc().role &&
+          incoming().is_edited == false &&
+          incoming().last_edited_by == '' &&
+          incoming().last_edited_by_name == '' &&
+          incoming().last_edit_log_id == '' &&
+          incoming().created_at == request.time &&
+          incoming().updated_at == request.time &&
+          exists(/databases/$(database)/documents/cases/$(caseId)) &&
+          (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id) &&
+          (!incoming().sla_changed || getAfter(/databases/$(database)/documents/cases/$(caseId)).data.sla_due_at == incoming().new_sla_due_at);
+        allow update: if isActiveUser() && isValidId(caseId) && isValidId(noteId) &&
+          isValidInternalNote(incoming(), noteId, caseId) &&
+          incoming().id == existing().id &&
+          incoming().case_id == existing().case_id &&
+          incoming().author_id == existing().author_id &&
+          incoming().author_name == existing().author_name &&
+          incoming().author_role == existing().author_role &&
+          incoming().sla_changed == existing().sla_changed &&
+          incoming().previous_sla_due_at == existing().previous_sla_due_at &&
+          incoming().created_at == existing().created_at &&
+          incoming().updated_at == request.time &&
+          incoming().is_edited == true &&
+          incoming().last_edited_by == request.auth.uid &&
+          incoming().last_edited_by_name.size() >= 1 &&
+          isValidId(incoming().last_edit_log_id) &&
+          (
+            incoming().content != existing().content ||
+            incoming().new_sla_due_at != existing().new_sla_due_at ||
+            ('attachments' in incoming() && (!('attachments' in existing()) || incoming().attachments != existing().attachments)) ||
+            (!('attachments' in incoming()) && 'attachments' in existing())
+          ) &&
+          exists(/databases/$(database)/documents/cases/$(caseId)) &&
+          (
+            isAdmin() ||
+            isTL() ||
+            (existing().author_id == request.auth.uid && get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id)
+          ) &&
+          existsAfter(/databases/$(database)/documents/cases/$(caseId)/internal_notes/$(noteId)/edit_logs/$(incoming().last_edit_log_id)) &&
+          (incoming().new_sla_due_at == existing().new_sla_due_at || !incoming().sla_changed || getAfter(/databases/$(database)/documents/cases/$(caseId)).data.sla_due_at == incoming().new_sla_due_at) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'content', 'new_sla_due_at', 'attachments', 'is_edited',
+            'last_edited_by', 'last_edited_by_name', 'last_edit_log_id', 'updated_at'
+          ]);
+        allow delete: if isAdmin() && isValidId(caseId) && isValidId(noteId);
+
+        // Immutable edit audit logs for each Internal Note (only Admin can delete)
+        match /edit_logs/{logId} {
+          allow get: if isActiveUser() && isValidId(caseId) && isValidId(noteId) && isValidId(logId) &&
+            (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id);
+          allow list: if isActiveUser() && existing().case_id == caseId && existing().note_id == noteId &&
+            (isAdmin() || isTL() || get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id);
+          allow create: if isActiveUser() && isValidId(caseId) && isValidId(noteId) && isValidId(logId) &&
+            isValidInternalNoteEditLog(incoming(), logId, caseId, noteId) &&
+            incoming().editor_id == request.auth.uid &&
+            incoming().editor_role == userDoc().role &&
+            incoming().edited_at == request.time &&
+            exists(/databases/$(database)/documents/cases/$(caseId)/internal_notes/$(noteId)) &&
+            (
+              isAdmin() ||
+              isTL() ||
+              (
+                get(/databases/$(database)/documents/cases/$(caseId)/internal_notes/$(noteId)).data.author_id == request.auth.uid &&
+                get(/databases/$(database)/documents/cases/$(caseId)).data.team_id == userDoc().team_id
+              )
+            ) &&
+            getAfter(/databases/$(database)/documents/cases/$(caseId)/internal_notes/$(noteId)).data.last_edit_log_id == logId &&
+            incoming().old_content == get(/databases/$(database)/documents/cases/$(caseId)/internal_notes/$(noteId)).data.content &&
+            incoming().new_content == getAfter(/databases/$(database)/documents/cases/$(caseId)/internal_notes/$(noteId)).data.content &&
+            incoming().old_sla_due_at == get(/databases/$(database)/documents/cases/$(caseId)/internal_notes/$(noteId)).data.new_sla_due_at &&
+            incoming().new_sla_due_at == getAfter(/databases/$(database)/documents/cases/$(caseId)/internal_notes/$(noteId)).data.new_sla_due_at;
+          allow update: if false;
+          allow delete: if isAdmin() && isValidId(caseId) && isValidId(noteId) && isValidId(logId);
+        }
       }
     }
   }

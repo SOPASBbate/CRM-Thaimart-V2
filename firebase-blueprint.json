@@ -329,7 +329,7 @@
         },
         "ack_stage": {
           "type": "string",
-          "enum": ["pre_30m", "due_reached"]
+          "enum": ["pre_30m", "due_reached", "due_today", "overdue"]
         },
         "sla_due_at": {
           "type": "string",
@@ -357,11 +357,11 @@
         "case_no": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 64
+          "maxLength": 1000
         },
         "shop_id": {
           "type": "string",
-          "minLength": 1,
+          "minLength": 0,
           "maxLength": 64
         },
         "issue_summary": {
@@ -429,6 +429,10 @@
         "resolved_at": {
           "type": "string",
           "maxLength": 64
+        },
+        "pending_escalation_id": {
+          "type": "string",
+          "maxLength": 128
         },
         "created_at": {
           "type": "string",
@@ -503,6 +507,423 @@
         }
       },
       "required": ["id", "case_id", "user_id", "user_name", "ack_level", "note", "ack_at"]
+    },
+    "InternalNote": {
+      "title": "InternalNote",
+      "description": "Internal update note on a case, optionally adjusting SLA without altering original case details.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "case_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "author_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "author_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "author_role": {
+          "type": "string",
+          "enum": ["admin", "tl", "agent"]
+        },
+        "content": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "sla_changed": {
+          "type": "boolean"
+        },
+        "previous_sla_due_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "new_sla_due_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "attachments": {
+          "type": "array",
+          "description": "Up to 5 file/image/video attachment descriptors stored via backend upload."
+        },
+        "is_edited": {
+          "type": "boolean"
+        },
+        "last_edited_by": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "last_edited_by_name": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "last_edit_log_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "case_id",
+        "author_id",
+        "author_name",
+        "author_role",
+        "content",
+        "sla_changed",
+        "previous_sla_due_at",
+        "new_sla_due_at",
+        "is_edited",
+        "last_edited_by",
+        "last_edited_by_name",
+        "last_edit_log_id",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "InternalNoteEditLog": {
+      "title": "InternalNoteEditLog",
+      "description": "Immutable audit log recording before/after values whenever an Internal Note is edited.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "note_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "case_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "editor_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "editor_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "editor_role": {
+          "type": "string",
+          "enum": ["admin", "tl", "agent"]
+        },
+        "old_content": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "new_content": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "old_sla_due_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "new_sla_due_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "old_attachments_summary": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "new_attachments_summary": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "edited_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "note_id",
+        "case_id",
+        "editor_id",
+        "editor_name",
+        "editor_role",
+        "old_content",
+        "new_content",
+        "old_sla_due_at",
+        "new_sla_due_at",
+        "edited_at"
+      ]
+    },
+    "CaseEscalation": {
+      "title": "CaseEscalation",
+      "description": "Cross-user case escalation request supporting accept/reject and real-time sender/recipient alerts.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "case_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "case_no": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "shop_id": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 64
+        },
+        "issue_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "details_preview": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "sla_due_at": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 64
+        },
+        "from_user_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "from_user_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "from_team_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "from_team_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "to_user_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "to_user_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "to_team_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "to_team_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "accepted", "rejected"]
+        },
+        "reject_reason": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "sender_ack_done": {
+          "type": "boolean"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "case_id",
+        "case_no",
+        "shop_id",
+        "issue_summary",
+        "details_preview",
+        "sla_due_at",
+        "from_user_id",
+        "from_user_name",
+        "from_team_id",
+        "from_team_name",
+        "to_user_id",
+        "to_user_name",
+        "to_team_id",
+        "to_team_name",
+        "note",
+        "status",
+        "reject_reason",
+        "sender_ack_done",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "CaseEscalationLog": {
+      "title": "CaseEscalationLog",
+      "description": "Per-case escalation audit history entry.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "case_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "from_user_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "from_user_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "from_team_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "from_team_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "to_user_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "to_user_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "to_team_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "to_team_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "accepted", "rejected"]
+        },
+        "reject_reason": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "sender_ack_done": {
+          "type": "boolean"
+        },
+        "sender_ack_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "case_id",
+        "from_user_id",
+        "from_user_name",
+        "from_team_id",
+        "from_team_name",
+        "to_user_id",
+        "to_user_name",
+        "to_team_id",
+        "to_team_name",
+        "note",
+        "status",
+        "reject_reason",
+        "created_at",
+        "updated_at"
+      ]
     }
   },
   "firestore": {
@@ -545,6 +966,22 @@
     "/cases/{caseId}/acknowledgments/{ackId}": {
       "schema": { "$ref": "#/entities/CaseAcknowledgment" },
       "description": "Acknowledgment audit history per case."
+    },
+    "/cases/{caseId}/internal_notes/{noteId}": {
+      "schema": { "$ref": "#/entities/InternalNote" },
+      "description": "Internal update notes per case with optional SLA adjustment."
+    },
+    "/cases/{caseId}/internal_notes/{noteId}/edit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/InternalNoteEditLog" },
+      "description": "Immutable edit history logs for each internal note."
+    },
+    "/case_escalations/{escalationId}": {
+      "schema": { "$ref": "#/entities/CaseEscalation" },
+      "description": "Active and historical case escalation requests for real-time notifications."
+    },
+    "/cases/{caseId}/escalation_logs/{logId}": {
+      "schema": { "$ref": "#/entities/CaseEscalationLog" },
+      "description": "Per-case escalation audit history."
     }
   }
 }

@@ -4,16 +4,19 @@ import {
   ArrowRight,
   CheckCircle2,
   Clock,
+  ExternalLink,
   FolderKanban,
   Plus,
 } from 'lucide-react';
+import { getSafeCaseUrl } from '../lib/caseLink.ts';
 import {
   computeLiveSlaState,
   formatSlaCountdown,
-  formatThaiDateTime,
+  formatThaiDate,
   getSlaLabel,
   getStatusLabel,
   needsUserAck,
+  toLocalDateInput,
 } from '../lib/sla.ts';
 import type { CaseItem, CaseStatus, DashboardSummary, UserPublic } from '../types.ts';
 
@@ -71,7 +74,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const unackCount = activeCases.filter((c) => needsUserAck(c, nowMs)).length;
 
   const urgentQueue = [...activeCases]
-    .sort((a, b) => new Date(a.sla_due_at).getTime() - new Date(b.sla_due_at).getTime())
+    .sort((a, b) => toLocalDateInput(a.sla_due_at).localeCompare(toLocalDateInput(b.sla_due_at)))
     .slice(0, 8);
 
   return (
@@ -129,14 +132,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
         <div className="bg-white border border-slate-200 rounded-xl p-5">
           <div className="flex items-center justify-between text-xs font-medium text-amber-700">
-            <span>ถึงกำหนด SLA (วันนี้ / 24 ชม.)</span>
+            <span>ถึงกำหนด SLA (วันนี้)</span>
             <Clock className="w-4 h-4 text-amber-600" />
           </div>
           <div className="mt-3 text-3xl font-semibold text-amber-700 font-mono tabular-nums">
             {dueTodayCases.length}
           </div>
           <div className="mt-2 text-xs text-slate-500">
-            เคสที่กำลังจะครบกำหนดในรอบวัน
+            เคสที่ครบกำหนดในวันนี้
           </div>
         </div>
 
@@ -272,9 +275,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="xl:col-span-7 bg-white border border-slate-200 rounded-xl overflow-hidden flex flex-col">
           <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
             <div>
-              <h2 className="text-sm font-semibold text-slate-900">คิวงานค้างเรียงตามกำหนด SLA แบบเรียลไทม์</h2>
+              <h2 className="text-sm font-semibold text-slate-900">คิวงานค้างเรียงตามวันครบกำหนด SLA</h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                อัปเดตตัวนับเวลาถอยหลังอัตโนมัติทุกวินาทีที่ค้างอยู่
+                อัปเดตสถานะถึงกำหนดวันนี้และเกินกำหนดอัตโนมัติ
               </p>
             </div>
             <button
@@ -308,6 +311,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {urgentQueue.map((item) => {
                 const liveSla = computeLiveSlaState(item.sla_due_at, item.status, nowMs);
                 const countdown = formatSlaCountdown(item.sla_due_at, item.status, nowMs);
+                const safeCaseUrl = getSafeCaseUrl(item.case_no);
                 return (
                   <div
                     key={item.id}
@@ -315,11 +319,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   >
                     <div className="min-w-0 space-y-1">
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500">
-                        <span className="font-mono font-semibold text-slate-900 tabular-nums">
-                          {item.case_no}
-                        </span>
-                        <span aria-hidden="true">·</span>
-                        <span className="font-mono text-slate-700 tabular-nums">SHOP {item.shop_id}</span>
+                        {safeCaseUrl ? (
+                          <a
+                            href={safeCaseUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 font-semibold text-blue-700 hover:text-blue-900 hover:underline"
+                          >
+                            <ExternalLink className="w-3 h-3 shrink-0" />
+                            <span>ลิงก์ไปที่เคส</span>
+                          </a>
+                        ) : (
+                          <span className="font-mono font-semibold text-slate-900 tabular-nums">
+                            {item.case_no}
+                          </span>
+                        )}
                         <span aria-hidden="true">·</span>
                         <span className="text-slate-700">{item.team_name}</span>
                         <span aria-hidden="true">·</span>
@@ -346,7 +360,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         </span>
                         <span className="text-slate-300" aria-hidden="true">·</span>
                         <span className="text-slate-500 tabular-nums">
-                          กำหนด {formatThaiDateTime(item.sla_due_at)}
+                          กำหนด {formatThaiDate(item.sla_due_at)}
                         </span>
                         <span className="text-slate-300" aria-hidden="true">·</span>
                         <span className="text-slate-600">{getStatusLabel(item.status)}</span>
