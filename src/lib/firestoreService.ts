@@ -35,7 +35,6 @@ import {
   summarizeAttachments,
 } from './attachments.ts';
 import { getSafeCaseUrl, MAX_CASE_LINK_LENGTH, normalizeCaseUrl } from './caseLink.ts';
-import type { CaseBackupSnapshot } from './googleSheetsBackup.ts';
 import { computeAlertStage, computeLiveSlaState, needsUserAck, toLocalDateInput } from './sla.ts';
 import type {
   AckHistoryEntry,
@@ -2012,108 +2011,4 @@ export async function deletePositionDoc(pos: Position, staffList: StaffEntry[]):
   await deleteDoc(doc(db, 'positions', pos.id)).catch((err) =>
     handleFirestoreError(err, OperationType.DELETE, `positions/${pos.id}`)
   );
-}
-
-// ==================== GOOGLE SHEETS BACKUP SNAPSHOT ====================
-
-export async function fetchCaseBackupSnapshot(cases: CaseItem[]): Promise<CaseBackupSnapshot> {
-  const notesByCase: Record<string, InternalNote[]> = {};
-  const editLogsByCase: Record<string, InternalNoteEditLog[]> = {};
-  const acksByCase: Record<string, AckHistoryEntry[]> = {};
-  const escalationLogsByCase: Record<string, CaseEscalationLog[]> = {};
-
-  let totalNotes = 0;
-  let totalHistoryEvents = 0;
-
-  // Fetch per-case subcollections in bounded batches to avoid connection spikes
-  const CHUNK_SIZE = 6;
-  for (let i = 0; i < cases.length; i += CHUNK_SIZE) {
-    const slice = cases.slice(i, i + CHUNK_SIZE);
-    await Promise.all(
-      slice.map(async (c) => {
-        const [notesSnap, acks, escLogsSnap] = await Promise.all([
-          getDocs(
-            query(collection(db, 'cases', c.id, 'internal_notes'), where('case_id', '==', c.id))
-          ).catch((err) =>
-            handleFirestoreError(err, OperationType.LIST, `cases/${c.id}/internal_notes`)
-          ),
-          fetchCaseAckHistory(c.id),
-          getDocs(
-            query(collection(db, 'cases', c.id, 'escalation_logs'), where('case_id', '==', c.id))
-          ).catch((err) =>
-            handleFirestoreError(err, OperationType.LIST, `cases/${c.id}/escalation_logs`)
-          ),
-        ]);
-
-        const notes: InternalNote[] = notesSnap.docs.map((d) => {
-          const data = d.data();
-          return {
-            id: d.id,
-            case_id: String(data.case_id ?? c.id),
-            author_id: String(data.author_id ?? ''),
-            author_name: String(data.author_name ?? ''),
-            author_role: (data.author_role as RoleLevel) ?? 'agent',
-            content: String(data.content ?? ''),
-            sla_changed: Boolean(data.sla_changed),
-            previous_sla_due_at: String(data.previous_sla_due_at ?? ''),
-            new_sla_due_at: String(data.new_sla_due_at ?? ''),
-            attachments: sanitizeAttachments(data.attachments),
-            is_edited: Boolean(data.is_edited),
-            last_edited_by: String(data.last_edited_by ?? ''),
-            last_edited_by_name: String(data.last_edited_by_name ?? ''),
-            last_edit_log_id: String(data.last_edit_log_id ?? ''),
-            created_at: timestampToIso(data.created_at),
-            updated_at: timestampToIso(data.updated_at),
-          };
-        });
-        notes.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-
-        const editedNotes = notes.filter((n) => n.is_edited);
-        const editLogArrays = await Promise.all(
-          editedNotes.map((n) => fetchInternalNoteEditLogs(c.id, n.id).catch(() => []))
-        );
-        const editLogs = editLogArrays.flat();
-
-        const escLogs: CaseEscalationLog[] = escLogsSnap.docs.map((d) => {
-          const data = d.data();
-          return {
-            id: d.id,
-            case_id: String(data.case_id ?? c.id),
-            from_user_id: String(data.from_user_id ?? ''),
-            from_user_name: String(data.from_user_name ?? ''),
-            from_team_id: String(data.from_team_id ?? ''),
-            from_team_name: String(data.from_team_name ?? ''),
-            to_user_id: String(data.to_user_id ?? ''),
-            to_user_name: String(data.to_user_name ?? ''),
-            to_team_id: String(data.to_team_id ?? ''),
-            to_team_name: String(data.to_team_name ?? ''),
-            note: String(data.note ?? ''),
-            status: (data.status as EscalationStatus) ?? 'pending',
-            reject_reason: String(data.reject_reason ?? ''),
-            sender_ack_done: Boolean(data.sender_ack_done),
-            sender_ack_at: data.sender_ack_at ? timestampToIso(data.sender_ack_at) : '',
-            created_at: timestampToIso(data.created_at),
-            updated_at: timestampToIso(data.updated_at),
-          };
-        });
-
-        notesByCase[c.id] = notes;
-        editLogsByCase[c.id] = editLogs;
-        acksByCase[c.id] = acks;
-        escalationLogsByCase[c.id] = escLogs;
-
-        totalNotes += notes.length;
-        totalHistoryEvents += acks.length + editLogs.length + escLogs.length;
-      })
-    );
-  }
-
-  return {
-    notesByCase,
-    editLogsByCase,
-    acksByCase,
-    escalationLogsByCase,
-    totalNotes,
-    totalHistoryEvents,
-  };
 }

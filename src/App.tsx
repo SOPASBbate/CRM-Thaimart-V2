@@ -4,7 +4,6 @@ import {
   AlertTriangle,
   ArrowRightLeft,
   CheckSquare,
-  FileSpreadsheet,
   KeyRound,
   LayoutDashboard,
   LogOut,
@@ -20,7 +19,6 @@ import { CaseModal } from './components/CaseModal.tsx';
 import { ChangePasswordModal } from './components/ChangePasswordModal.tsx';
 import { DashboardView } from './components/DashboardView.tsx';
 import { EscalationAlertModal } from './components/EscalationAlertModal.tsx';
-import { GoogleSheetsBackupView } from './components/GoogleSheetsBackupView.tsx';
 import { LoginView } from './components/LoginView.tsx';
 import { SlaAlertModal } from './components/SlaAlertModal.tsx';
 import { unlockAudio } from './lib/bell.ts';
@@ -58,7 +56,7 @@ import type {
   UserPublic,
 } from './types.ts';
 
-type NavView = 'dashboard' | 'cases' | 'backup' | 'admin';
+type NavView = 'dashboard' | 'cases' | 'admin';
 
 export default function App() {
   const [checkingAuth, setCheckingAuth] = useState(true);
@@ -377,7 +375,6 @@ export default function App() {
   const navItems: { id: NavView; label: string; icon: typeof LayoutDashboard }[] = [
     { id: 'dashboard', label: 'แดชบอร์ดติดตามเคส', icon: LayoutDashboard },
     { id: 'cases', label: 'รายการเคส To-Do', icon: CheckSquare },
-    { id: 'backup', label: 'สำรองข้อมูล Google ชีต', icon: FileSpreadsheet },
   ];
   if (currentUser.role === 'admin') {
     navItems.push({ id: 'admin', label: 'จัดการผู้ใช้และทีม', icon: Shield });
@@ -388,9 +385,7 @@ export default function App() {
       ? 'แดชบอร์ดติดตามเคส'
       : activeView === 'cases'
         ? 'รายการเคส To-Do'
-        : activeView === 'backup'
-          ? 'สำรองข้อมูล Google ชีต'
-          : 'จัดการระบบ (Admin)';
+        : 'จัดการระบบ (Admin)';
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex">
@@ -651,15 +646,6 @@ export default function App() {
                 setCaseModalOpen(true);
               }}
               onAcknowledgeOne={(item) => handleAcknowledgeOne(item)}
-            />
-          )}
-
-          {activeView === 'backup' && (
-            <GoogleSheetsBackupView
-              currentUser={currentUser}
-              cases={cases}
-              teams={teams}
-              nowMs={nowMs}
             />
           )}
 
