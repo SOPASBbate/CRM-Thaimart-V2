@@ -30,5 +30,6 @@ assert.match(rulesSource, /match \/case_escalations\/\{escalationId\}/);
 assert.match(rulesSource, /match \/escalation_logs\/\{logId\}/);
 assert.match(rulesSource, /isValidCaseEscalation\(/);
 assert.match(rulesSource, /isValidCaseEscalationLog\(/);
+assert.match(rulesSource, /'case_url'/);
 
 console.log('Verified all Firestore security rule invariants in firestore.rules.');

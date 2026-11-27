@@ -23,3 +23,41 @@ export function getSafeCaseUrl(raw: string | undefined | null): string | null {
 export function normalizeCaseUrl(raw: string): string | null {
   return getSafeCaseUrl(raw);
 }
+
+export interface CaseLinkDisplay {
+  label: string;
+  url: string | null;
+}
+
+/**
+ * Resolves the display label (case_no) and destination URL (case_url).
+ * Supports legacy records where the URL was stored directly inside case_no.
+ */
+export function resolveCaseLinkDisplay(
+  caseNo: string | undefined | null,
+  caseUrl?: string | undefined | null
+): CaseLinkDisplay {
+  const trimmedNo = (caseNo ?? '').trim();
+  const safeExplicitUrl = getSafeCaseUrl(caseUrl);
+  const safeNoAsUrl = getSafeCaseUrl(trimmedNo);
+
+  if (safeExplicitUrl) {
+    return {
+      label: safeNoAsUrl ? 'ลิงก์ไปที่เคส' : trimmedNo || 'ลิงก์ไปที่เคส',
+      url: safeExplicitUrl,
+    };
+  }
+
+  if (safeNoAsUrl) {
+    return {
+      label: 'ลิงก์ไปที่เคส',
+      url: safeNoAsUrl,
+    };
+  }
+
+  return {
+    label: trimmedNo || '-',
+    url: null,
+  };
+}
+

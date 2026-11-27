@@ -668,6 +668,7 @@ export function subscribeMyCaseAcks(
 export interface RawCaseDoc {
   id: string;
   case_no: string;
+  case_url?: string;
   shop_id: string;
   issue_summary: string;
   details: string;
@@ -706,6 +707,7 @@ export function subscribeRawCases(
         return {
           id: d.id,
           case_no: String(data.case_no ?? ''),
+          case_url: data.case_url ? String(data.case_url) : undefined,
           shop_id: String(data.shop_id ?? ''),
           issue_summary: String(data.issue_summary ?? ''),
           details: String(data.details ?? ''),
@@ -889,6 +891,7 @@ export async function createCaseDoc(
   currentUser: UserPublic,
   input: {
     case_no: string;
+    case_url: string;
     shop_id?: string;
     issue_summary: string;
     details: string;
@@ -897,22 +900,23 @@ export async function createCaseDoc(
   },
   existingCases: CaseItem[]
 ): Promise<void> {
-  const rawCaseNo = input.case_no.trim().slice(0, MAX_CASE_LINK_LENGTH);
+  const caseNo = input.case_no.trim().slice(0, MAX_CASE_LINK_LENGTH);
+  const rawCaseUrl = input.case_url.trim().slice(0, MAX_CASE_LINK_LENGTH);
   const shopId = (input.shop_id ?? '').trim().slice(0, 64);
   const issueSummary = input.issue_summary.trim().slice(0, 300);
   const details = input.details.trim().slice(0, 4000);
 
-  if (!rawCaseNo || !issueSummary || !input.sla_due_at) {
-    throw new Error('กรุณากรอกข้อมูลลิงก์เคส, รายละเอียดปัญหา และวันครบกำหนด SLA ให้ครบถ้วน');
+  if (!caseNo || !rawCaseUrl || !issueSummary || !input.sla_due_at) {
+    throw new Error('กรุณากรอกเลขเคส, ลิงก์เคส, รายละเอียดปัญหา และวันครบกำหนด SLA ให้ครบถ้วน');
   }
 
-  const caseNo = normalizeCaseUrl(rawCaseNo);
-  if (!caseNo) {
+  const caseUrl = normalizeCaseUrl(rawCaseUrl);
+  if (!caseUrl) {
     throw new Error('กรุณาระบุลิงก์เคส (URL) ที่ถูกต้อง โดยขึ้นต้นด้วย https:// หรือ http:// (ไม่เกิน 1,000 ตัวอักษร)');
   }
 
   if (existingCases.some((c) => c.case_no.toLowerCase() === caseNo.toLowerCase())) {
-    throw new Error('ลิงก์เคสนี้มีอยู่ในระบบแล้ว');
+    throw new Error(`เลขเคส "${caseNo}" มีอยู่ในระบบแล้ว`);
   }
 
   const newRef = doc(collection(db, 'cases'));
@@ -921,6 +925,7 @@ export async function createCaseDoc(
   await setDoc(newRef, {
     id: newRef.id,
     case_no: caseNo,
+    case_url: caseUrl,
     shop_id: shopId,
     issue_summary: issueSummary,
     details,
@@ -947,6 +952,7 @@ export async function updateCaseDoc(
   editingCase: CaseItem,
   input: {
     case_no?: string;
+    case_url?: string;
     shop_id?: string;
     issue_summary?: string;
     details?: string;
@@ -961,8 +967,13 @@ export async function updateCaseDoc(
 ): Promise<void> {
   const isAdmin = currentUser.role === 'admin';
   const nextStatus = input.status ?? editingCase.status;
+  // When transitioning into 'done' (or reopening & closing again), restart the 15-day retention timer.
   const resolvedAt =
-    nextStatus === 'done' ? (editingCase.resolved_at || new Date().toISOString()) : '';
+    nextStatus === 'done'
+      ? editingCase.status !== 'done' || !editingCase.resolved_at
+        ? new Date().toISOString()
+        : editingCase.resolved_at
+      : '';
 
   const payload: Record<string, unknown> = {
     status: nextStatus,
@@ -972,23 +983,31 @@ export async function updateCaseDoc(
   };
 
   if (isAdmin) {
-    const rawCaseNo = (input.case_no ?? editingCase.case_no).trim().slice(0, MAX_CASE_LINK_LENGTH);
-    if (!rawCaseNo) {
-      throw new Error('กรุณาระบุลิงก์เคส (URL)');
-    }
-    const requiresUrlCheck =
-      rawCaseNo !== editingCase.case_no || getSafeCaseUrl(editingCase.case_no) !== null;
-    const caseNo = requiresUrlCheck ? normalizeCaseUrl(rawCaseNo) : rawCaseNo;
+    const caseNo = (input.case_no ?? editingCase.case_no).trim().slice(0, MAX_CASE_LINK_LENGTH);
     if (!caseNo) {
-      throw new Error('กรุณาระบุลิงก์เคส (URL) ที่ถูกต้อง โดยขึ้นต้นด้วย https:// หรือ http:// (ไม่เกิน 1,000 ตัวอักษร)');
+      throw new Error('กรุณาระบุเลขเคส');
     }
     if (
       caseNo.toLowerCase() !== editingCase.case_no.toLowerCase() &&
       existingCases.some((c) => c.id !== editingCase.id && c.case_no.toLowerCase() === caseNo.toLowerCase())
     ) {
-      throw new Error('ลิงก์เคสนี้มีอยู่ในระบบแล้ว');
+      throw new Error(`เลขเคส "${caseNo}" มีอยู่ในระบบแล้ว`);
     }
     payload.case_no = caseNo;
+
+    const rawCaseUrl = (input.case_url ?? editingCase.case_url ?? '')
+      .trim()
+      .slice(0, MAX_CASE_LINK_LENGTH);
+    if (rawCaseUrl) {
+      const normalizedUrl = normalizeCaseUrl(rawCaseUrl);
+      if (!normalizedUrl) {
+        throw new Error('กรุณาระบุลิงก์เคส (URL) ที่ถูกต้อง โดยขึ้นต้นด้วย https:// หรือ http:// (ไม่เกิน 1,000 ตัวอักษร)');
+      }
+      payload.case_url = normalizedUrl;
+    } else if (editingCase.case_url !== undefined) {
+      payload.case_url = '';
+    }
+
     payload.shop_id = (input.shop_id ?? editingCase.shop_id).trim().slice(0, 64);
     payload.issue_summary = (input.issue_summary ?? editingCase.issue_summary).trim().slice(0, 300);
     payload.details = (input.details ?? editingCase.details).trim().slice(0, 4000);
@@ -1494,6 +1513,7 @@ function mapEscalationDoc(id: string, data: Record<string, unknown>): CaseEscala
     id,
     case_id: String(data.case_id ?? ''),
     case_no: String(data.case_no ?? ''),
+    case_url: data.case_url ? String(data.case_url) : undefined,
     shop_id: String(data.shop_id ?? ''),
     issue_summary: String(data.issue_summary ?? ''),
     details_preview: String(data.details_preview ?? ''),
@@ -1631,11 +1651,14 @@ export async function createCaseEscalationDoc(
   const cleanNote = note.trim().slice(0, 500);
   const slaDue = (toLocalDateInput(caseItem.sla_due_at) || caseItem.sla_due_at).slice(0, 64);
 
+  const resolvedCaseUrl = getSafeCaseUrl(caseItem.case_url) ?? getSafeCaseUrl(caseItem.case_no);
+
   const batch = writeBatch(db);
   batch.set(escRef, {
     id: escRef.id,
     case_id: caseItem.id,
     case_no: caseItem.case_no.slice(0, MAX_CASE_LINK_LENGTH),
+    ...(resolvedCaseUrl ? { case_url: resolvedCaseUrl.slice(0, MAX_CASE_LINK_LENGTH) } : {}),
     shop_id: caseItem.shop_id.slice(0, 64),
     issue_summary: caseItem.issue_summary.slice(0, 300),
     details_preview: caseItem.details.slice(0, 4000),

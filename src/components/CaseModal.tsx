@@ -30,7 +30,7 @@ import {
   MAX_NOTE_ATTACHMENTS,
   uploadNoteAttachment,
 } from '../lib/attachments.ts';
-import { getSafeCaseUrl } from '../lib/caseLink.ts';
+import { getSafeCaseUrl, resolveCaseLinkDisplay } from '../lib/caseLink.ts';
 import {
   createCaseDoc,
   createCaseEscalationDoc,
@@ -46,6 +46,7 @@ import {
   updateInternalNoteDoc,
 } from '../lib/firestoreService.ts';
 import {
+  computeClosedCaseRetention,
   computeLiveSlaState,
   formatThaiDate,
   formatThaiDateTime,
@@ -69,6 +70,7 @@ interface CaseModalProps {
   open: boolean;
   editingCase: CaseItem | null;
   currentUser: UserPublic;
+  nowMs: number;
   teams: Team[];
   assignableUsers: UserPublic[];
   allActiveUsers: UserPublic[];
@@ -145,6 +147,7 @@ export const CaseModal: React.FC<CaseModalProps> = ({
   open,
   editingCase,
   currentUser,
+  nowMs,
   teams,
   assignableUsers,
   allActiveUsers,
@@ -171,6 +174,7 @@ export const CaseModal: React.FC<CaseModalProps> = ({
   const [historySortAsc, setHistorySortAsc] = useState(true);
 
   const [caseNo, setCaseNo] = useState('');
+  const [caseUrl, setCaseUrl] = useState('');
   const [issueSummary, setIssueSummary] = useState('');
   const [details, setDetails] = useState('');
   const [status, setStatus] = useState<CaseStatus>('todo');
@@ -256,7 +260,9 @@ export const CaseModal: React.FC<CaseModalProps> = ({
     setEscalateActionBusy(false);
 
     if (editingCase) {
+      const legacyUrl = !editingCase.case_url ? getSafeCaseUrl(editingCase.case_no) : null;
       setCaseNo(editingCase.case_no);
+      setCaseUrl(editingCase.case_url ?? legacyUrl ?? '');
       setIssueSummary(editingCase.issue_summary);
       setDetails(editingCase.details);
       setStatus(editingCase.status);
@@ -270,6 +276,7 @@ export const CaseModal: React.FC<CaseModalProps> = ({
         .catch(() => setAckHistory([]));
     } else {
       setCaseNo('');
+      setCaseUrl('');
       setIssueSummary('');
       setDetails('');
       setStatus('todo');
@@ -553,6 +560,7 @@ export const CaseModal: React.FC<CaseModalProps> = ({
           currentUser,
           {
             case_no: caseNo,
+            case_url: caseUrl,
             issue_summary: issueSummary,
             details,
             status,
@@ -581,6 +589,7 @@ export const CaseModal: React.FC<CaseModalProps> = ({
           activeCase,
           {
             case_no: caseNo,
+            case_url: caseUrl,
             issue_summary: issueSummary,
             details,
             status,
@@ -893,7 +902,18 @@ export const CaseModal: React.FC<CaseModalProps> = ({
   const displayTeamName = isNew ? currentUser.team_name : activeCase.team_name;
   const displayAssigneeName = isNew ? currentUser.display_name : activeCase.assignee_name;
   const selectedEscalateTarget = escalateRecipients.find((u) => u.uid === escalateTargetId);
-  const safeActiveCaseUrl = !isNew && activeCase ? getSafeCaseUrl(activeCase.case_no) : null;
+  const activeCaseLink =
+    !isNew && activeCase
+      ? resolveCaseLinkDisplay(activeCase.case_no, activeCase.case_url)
+      : null;
+  const closedRetention =
+    !isNew && activeCase
+      ? computeClosedCaseRetention(
+          activeCase.resolved_at || activeCase.updated_at,
+          activeCase.status,
+          nowMs
+        )
+      : null;
 
   return (
     <div
@@ -910,17 +930,23 @@ export const CaseModal: React.FC<CaseModalProps> = ({
               <h2 id="case-modal-title" className="text-base font-semibold text-slate-900">
                 {isNew ? 'เปิดเคสใหม่ (To-Do Case)' : 'รายละเอียดเคส (To-Do Case)'}
               </h2>
-              {safeActiveCaseUrl && (
-                <a
-                  href={safeActiveCaseUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 rounded-md border border-blue-200 bg-blue-50 hover:bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 transition-colors"
-                >
-                  <ExternalLink className="w-3 h-3 shrink-0" />
-                  <span>ลิงก์ไปที่เคส</span>
-                </a>
-              )}
+              {activeCaseLink &&
+                (activeCaseLink.url ? (
+                  <a
+                    href={activeCaseLink.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="คลิกเพื่อเปิดลิงก์เคส"
+                    className="inline-flex items-center gap-1 rounded-md border border-blue-200 bg-blue-50 hover:bg-blue-100 px-2.5 py-0.5 font-mono text-xs font-semibold text-blue-700 transition-colors"
+                  >
+                    <span>{activeCaseLink.label}</span>
+                    <ExternalLink className="w-3 h-3 shrink-0" />
+                  </a>
+                ) : (
+                  <span className="inline-flex items-center rounded-md border border-slate-200 bg-slate-100 px-2.5 py-0.5 font-mono text-xs font-semibold text-slate-700">
+                    {activeCaseLink.label}
+                  </span>
+                ))}
             </div>
             <p className="text-xs text-slate-500 mt-0.5">
               {isNew
@@ -1051,35 +1077,73 @@ export const CaseModal: React.FC<CaseModalProps> = ({
                   )}
                 </div>
 
+                {closedRetention && activeCase && (
+                  <div
+                    className={`rounded-lg border px-4 py-3 flex items-start gap-2.5 text-xs ${
+                      closedRetention.isExpired
+                        ? 'border-red-200 bg-red-50 text-red-800'
+                        : 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                    }`}
+                  >
+                    <Clock className="w-4 h-4 shrink-0 mt-0.5" />
+                    <div className="space-y-0.5">
+                      <div className="font-semibold">
+                        เคสปิดสำเร็จแล้ว · {closedRetention.countdownText}
+                      </div>
+                      <div className="opacity-90">
+                        ปิดเคสเมื่อ {formatThaiDateTime(activeCase.resolved_at || activeCase.updated_at)} ·
+                        ระบบจะเก็บข้อมูลไว้ 15 วันก่อนลบอัตโนมัติ (หากปรับสถานะกลับมาดำเนินการ จะหยุดนับและเริ่มนับ 15 วันใหม่เมื่อปิดเคสอีกครั้ง)
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {canEditOriginalDetails ? (
                   <>
-                    <div>
-                      <div className="flex items-center justify-between gap-2 mb-1.5">
-                        <label htmlFor="case-no" className="block text-sm font-medium text-slate-700">
-                          ลิงก์เคส <span className="text-red-600">*</span>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label htmlFor="case-no" className="block text-sm font-medium text-slate-700 mb-1.5">
+                          เลขเคส <span className="text-red-600">*</span>
                         </label>
-                        {getSafeCaseUrl(caseNo) && (
-                          <a
-                            href={getSafeCaseUrl(caseNo)!}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 hover:text-blue-900 hover:underline"
-                          >
-                            <ExternalLink className="w-3 h-3 shrink-0" />
-                            <span>ลิงก์ไปที่เคส</span>
-                          </a>
-                        )}
+                        <input
+                          id="case-no"
+                          type="text"
+                          required
+                          value={caseNo}
+                          onChange={(e) => setCaseNo(e.target.value)}
+                          placeholder="เช่น CASE-2026-001 หรือหมายเลขทิกเก็ต"
+                          className="w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-mono text-slate-900 focus:border-blue-600 focus:outline-none"
+                        />
                       </div>
-                      <input
-                        id="case-no"
-                        type="text"
-                        inputMode="url"
-                        required
-                        value={caseNo}
-                        onChange={(e) => setCaseNo(e.target.value)}
-                        placeholder="https://... (วางลิงก์ URL ของเคส)"
-                        className="w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-600 focus:outline-none"
-                      />
+
+                      <div>
+                        <div className="flex items-center justify-between gap-2 mb-1.5">
+                          <label htmlFor="case-url" className="block text-sm font-medium text-slate-700">
+                            ลิงก์เคส (URL) {(isNew || Boolean(caseUrl.trim())) && <span className="text-red-600">*</span>}
+                          </label>
+                          {getSafeCaseUrl(caseUrl) && (
+                            <a
+                              href={getSafeCaseUrl(caseUrl)!}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 hover:text-blue-900 hover:underline"
+                            >
+                              <ExternalLink className="w-3 h-3 shrink-0" />
+                              <span>เปิดลิงก์เคส</span>
+                            </a>
+                          )}
+                        </div>
+                        <input
+                          id="case-url"
+                          type="text"
+                          inputMode="url"
+                          required={isNew}
+                          value={caseUrl}
+                          onChange={(e) => setCaseUrl(e.target.value)}
+                          placeholder="https://... (วางลิงก์ URL ของเคส)"
+                          className="w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 focus:border-blue-600 focus:outline-none"
+                        />
+                      </div>
                     </div>
 
                     <div>
@@ -1188,19 +1252,21 @@ export const CaseModal: React.FC<CaseModalProps> = ({
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
                       <div>
-                        <div className="text-xs text-slate-500">ลิงก์เคส</div>
-                        {safeActiveCaseUrl ? (
+                        <div className="text-xs text-slate-500">เลขเคส</div>
+                        {activeCaseLink?.url ? (
                           <a
-                            href={safeActiveCaseUrl}
+                            href={activeCaseLink.url}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="mt-0.5 inline-flex items-center gap-1 text-sm font-semibold text-blue-700 hover:text-blue-900 hover:underline"
+                            className="mt-0.5 inline-flex items-center gap-1.5 font-mono text-sm font-semibold text-blue-700 hover:text-blue-900 hover:underline"
                           >
+                            <span>{activeCaseLink.label}</span>
                             <ExternalLink className="w-3.5 h-3.5 shrink-0" />
-                            <span>ลิงก์ไปที่เคส</span>
                           </a>
                         ) : (
-                          <div className="mt-0.5 font-mono font-semibold text-slate-900">{activeCase.case_no}</div>
+                          <div className="mt-0.5 font-mono font-semibold text-slate-900">
+                            {activeCaseLink?.label ?? activeCase.case_no}
+                          </div>
                         )}
                       </div>
                       <div>

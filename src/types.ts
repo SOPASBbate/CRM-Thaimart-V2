@@ -76,6 +76,7 @@ export interface UserCaseAck {
 export interface CaseItem {
   id: string;
   case_no: string;
+  case_url?: string;
   shop_id: string;
   issue_summary: string;
   details: string;
@@ -160,6 +161,7 @@ export interface CaseEscalation {
   id: string;
   case_id: string;
   case_no: string;
+  case_url?: string;
   shop_id: string;
   issue_summary: string;
   details_preview: string;

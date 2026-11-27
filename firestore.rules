@@ -199,7 +199,7 @@ service cloud.firestore {
           'last_ack_level', 'resolved_at', 'created_at', 'updated_at'
         ]) &&
         data.keys().hasOnly([
-          'id', 'case_no', 'shop_id', 'issue_summary', 'details', 'status',
+          'id', 'case_no', 'case_url', 'shop_id', 'issue_summary', 'details', 'status',
           'team_id', 'team_name', 'assignee_id', 'assignee_name', 'created_by',
           'sla_due_at', 'last_ack_at', 'last_ack_by', 'last_ack_by_name',
           'last_ack_level', 'resolved_at', 'pending_escalation_id', 'created_at', 'updated_at'
@@ -207,6 +207,7 @@ service cloud.firestore {
         isValidId(data.id) &&
         data.id == docId &&
         data.case_no is string && data.case_no.size() >= 1 && data.case_no.size() <= 1000 &&
+        (!('case_url' in data) || (data.case_url is string && data.case_url.size() <= 1000)) &&
         data.shop_id is string && data.shop_id.size() <= 64 &&
         data.issue_summary is string && data.issue_summary.size() >= 1 && data.issue_summary.size() <= 300 &&
         data.details is string && data.details.size() <= 4000 &&
@@ -336,7 +337,7 @@ service cloud.firestore {
           'note', 'status', 'reject_reason', 'sender_ack_done', 'created_at', 'updated_at'
         ]) &&
         data.keys().hasOnly([
-          'id', 'case_id', 'case_no', 'shop_id', 'issue_summary', 'details_preview', 'sla_due_at',
+          'id', 'case_id', 'case_no', 'case_url', 'shop_id', 'issue_summary', 'details_preview', 'sla_due_at',
           'from_user_id', 'from_user_name', 'from_team_id', 'from_team_name',
           'to_user_id', 'to_user_name', 'to_team_id', 'to_team_name',
           'note', 'status', 'reject_reason', 'sender_ack_done', 'created_at', 'updated_at'
@@ -345,6 +346,7 @@ service cloud.firestore {
         data.id == docId &&
         isValidId(data.case_id) &&
         data.case_no is string && data.case_no.size() >= 1 && data.case_no.size() <= 1000 &&
+        (!('case_url' in data) || (data.case_url is string && data.case_url.size() <= 1000)) &&
         data.shop_id is string && data.shop_id.size() <= 64 &&
         data.issue_summary is string && data.issue_summary.size() >= 1 && data.issue_summary.size() <= 300 &&
         data.details_preview is string && data.details_preview.size() <= 4000 &&
@@ -657,6 +659,7 @@ service cloud.firestore {
         incoming().id == existing().id &&
         incoming().case_id == existing().case_id &&
         incoming().case_no == existing().case_no &&
+        (!('case_url' in existing()) ? !('case_url' in incoming()) : ('case_url' in incoming() && incoming().case_url == existing().case_url)) &&
         incoming().shop_id == existing().shop_id &&
         incoming().issue_summary == existing().issue_summary &&
         incoming().details_preview == existing().details_preview &&
@@ -735,7 +738,7 @@ service cloud.firestore {
           // Action 1: Admin full case update & reassignment
           (
             incoming().diff(existing()).affectedKeys().hasOnly([
-              'case_no', 'shop_id', 'issue_summary', 'details', 'status',
+              'case_no', 'case_url', 'shop_id', 'issue_summary', 'details', 'status',
               'team_id', 'team_name', 'assignee_id', 'assignee_name',
               'sla_due_at', 'last_ack_at', 'last_ack_by', 'last_ack_by_name',
               'last_ack_level', 'resolved_at', 'pending_escalation_id', 'updated_at'

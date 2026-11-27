@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { AlertTriangle, Bell, Check, Clock, ExternalLink, Volume2, VolumeX, X } from 'lucide-react';
 import { playBellChime, unlockAudio } from '../lib/bell.ts';
-import { getSafeCaseUrl } from '../lib/caseLink.ts';
+import { resolveCaseLinkDisplay } from '../lib/caseLink.ts';
 import { computeAlertStage, formatSlaCountdown, formatThaiDate } from '../lib/sla.ts';
 import type { CaseItem } from '../types.ts';
 
@@ -130,19 +130,25 @@ export const SlaAlertModal: React.FC<SlaAlertModalProps> = ({
               <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                 <div className="space-y-1 min-w-0">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
-                    {getSafeCaseUrl(item.case_no) ? (
-                      <a
-                        href={getSafeCaseUrl(item.case_no)!}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 font-semibold text-blue-700 hover:text-blue-900 hover:underline"
-                      >
-                        <ExternalLink className="w-3.5 h-3.5 shrink-0" />
-                        <span>ลิงก์ไปที่เคส</span>
-                      </a>
-                    ) : (
-                      <span className="font-mono font-semibold text-slate-900 tabular-nums">{item.case_no}</span>
-                    )}
+                    {(() => {
+                      const caseLink = resolveCaseLinkDisplay(item.case_no, item.case_url);
+                      return caseLink.url ? (
+                        <a
+                          href={caseLink.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="คลิกเพื่อเปิดลิงก์เคส"
+                          className="inline-flex items-center gap-1 font-mono font-semibold text-blue-700 hover:text-blue-900 hover:underline tabular-nums"
+                        >
+                          <span>{caseLink.label}</span>
+                          <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                        </a>
+                      ) : (
+                        <span className="font-mono font-semibold text-slate-900 tabular-nums">
+                          {caseLink.label}
+                        </span>
+                      );
+                    })()}
                     <span aria-hidden="true">·</span>
                     <span className="text-slate-700">{item.team_name}</span>
                     <span aria-hidden="true">·</span>

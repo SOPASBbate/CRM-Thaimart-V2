@@ -359,6 +359,10 @@
           "minLength": 1,
           "maxLength": 1000
         },
+        "case_url": {
+          "type": "string",
+          "maxLength": 1000
+        },
         "shop_id": {
           "type": "string",
           "minLength": 0,
@@ -705,6 +709,10 @@
         "case_no": {
           "type": "string",
           "minLength": 1,
+          "maxLength": 1000
+        },
+        "case_url": {
+          "type": "string",
           "maxLength": 1000
         },
         "shop_id": {

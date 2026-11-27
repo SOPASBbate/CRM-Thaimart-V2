@@ -8,7 +8,7 @@ import {
   FolderKanban,
   Plus,
 } from 'lucide-react';
-import { getSafeCaseUrl } from '../lib/caseLink.ts';
+import { resolveCaseLinkDisplay } from '../lib/caseLink.ts';
 import {
   computeLiveSlaState,
   formatSlaCountdown,
@@ -165,7 +165,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             {resolvedCount}
           </div>
           <div className="mt-2 text-xs text-slate-500 tabular-nums">
-            จากทั้งหมด {cases.length} เคสในขอบเขต
+            เก็บข้อมูล 15 วันก่อนลบอัตโนมัติ · ทั้งหมด {cases.length} เคส
           </div>
         </div>
       </div>
@@ -311,7 +311,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {urgentQueue.map((item) => {
                 const liveSla = computeLiveSlaState(item.sla_due_at, item.status, nowMs);
                 const countdown = formatSlaCountdown(item.sla_due_at, item.status, nowMs);
-                const safeCaseUrl = getSafeCaseUrl(item.case_no);
+                const caseLink = resolveCaseLinkDisplay(item.case_no, item.case_url);
                 return (
                   <div
                     key={item.id}
@@ -319,19 +319,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   >
                     <div className="min-w-0 space-y-1">
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500">
-                        {safeCaseUrl ? (
+                        {caseLink.url ? (
                           <a
-                            href={safeCaseUrl}
+                            href={caseLink.url}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 font-semibold text-blue-700 hover:text-blue-900 hover:underline"
+                            title="คลิกเพื่อเปิดลิงก์เคส"
+                            className="inline-flex items-center gap-1 font-mono font-semibold text-blue-700 hover:text-blue-900 hover:underline tabular-nums"
                           >
+                            <span>{caseLink.label}</span>
                             <ExternalLink className="w-3 h-3 shrink-0" />
-                            <span>ลิงก์ไปที่เคส</span>
                           </a>
                         ) : (
                           <span className="font-mono font-semibold text-slate-900 tabular-nums">
-                            {item.case_no}
+                            {caseLink.label}
                           </span>
                         )}
                         <span aria-hidden="true">·</span>

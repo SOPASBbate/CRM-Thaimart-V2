@@ -29,6 +29,7 @@ import {
   acknowledgeCasesBulkForUser,
   acknowledgeRejectedEscalationDoc,
   buildDashboardSummary,
+  deleteCaseDoc,
   enrichCasesForUser,
   rejectCaseEscalationDoc,
   resolveAuthenticatedUser,
@@ -44,7 +45,7 @@ import {
   updateCaseDoc,
   type RawCaseDoc,
 } from './lib/firestoreService.ts';
-import { computeAlertStage, needsUserAck } from './lib/sla.ts';
+import { computeAlertStage, computeClosedCaseRetention, needsUserAck } from './lib/sla.ts';
 import type {
   CaseEscalation,
   CaseItem,
@@ -97,6 +98,7 @@ export default function App() {
   // Track which alert signatures were already triggered automatically
   const seenAlertKeysRef = useRef<Set<string>>(new Set());
   const seenEscalationKeysRef = useRef<Set<string>>(new Set());
+  const deletingExpiredIdsRef = useRef<Set<string>>(new Set());
 
   if (firestoreError) {
     throw firestoreError;
@@ -121,6 +123,7 @@ export default function App() {
     setEscalationModalOpen(false);
     seenAlertKeysRef.current.clear();
     seenEscalationKeysRef.current.clear();
+    deletingExpiredIdsRef.current.clear();
     setActiveView('dashboard');
   }, []);
 
@@ -233,6 +236,25 @@ export default function App() {
     }
     return activeUsers;
   }, [currentUser, activeUsers]);
+
+  // Automatically purge closed cases once their 15-day retention countdown expires
+  useEffect(() => {
+    if (!currentUser || currentUser.role !== 'admin') return;
+
+    const expiredCases = cases.filter((c) => {
+      if (c.status !== 'done') return false;
+      const retention = computeClosedCaseRetention(c.resolved_at || c.updated_at, c.status, nowMs);
+      return Boolean(retention?.isExpired);
+    });
+
+    for (const item of expiredCases) {
+      if (deletingExpiredIdsRef.current.has(item.id)) continue;
+      deletingExpiredIdsRef.current.add(item.id);
+      void deleteCaseDoc(item.id).catch(() => {
+        deletingExpiredIdsRef.current.delete(item.id);
+      });
+    }
+  }, [currentUser, cases, nowMs]);
 
   // Compute unacknowledged SLA alerts for the current user (due today + overdue)
   const unacknowledgedAlerts = useMemo(() => {
@@ -666,6 +688,7 @@ export default function App() {
         open={caseModalOpen}
         editingCase={editingCase}
         currentUser={currentUser}
+        nowMs={nowMs}
         teams={teams}
         assignableUsers={assignableUsers}
         allActiveUsers={activeUsers}

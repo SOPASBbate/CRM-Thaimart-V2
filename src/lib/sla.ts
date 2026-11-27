@@ -106,6 +106,74 @@ export function formatSlaCountdown(slaDueAt: string, status: CaseStatus, nowMs: 
   return `อีก ${diffDays} วัน`;
 }
 
+export const CLOSED_CASE_RETENTION_DAYS = 15;
+export const CLOSED_CASE_RETENTION_MS = CLOSED_CASE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+export interface ClosedCaseRetention {
+  resolvedAtMs: number;
+  expiresAtMs: number;
+  remainingMs: number;
+  isExpired: boolean;
+  countdownText: string;
+  shortCountdownText: string;
+}
+
+export function computeClosedCaseRetention(
+  resolvedAt: string | null | undefined,
+  status: CaseStatus,
+  nowMs: number
+): ClosedCaseRetention | null {
+  if (status !== 'done' || !resolvedAt) return null;
+  const resolvedAtMs = new Date(resolvedAt).getTime();
+  if (Number.isNaN(resolvedAtMs)) return null;
+
+  const expiresAtMs = resolvedAtMs + CLOSED_CASE_RETENTION_MS;
+  const remainingMs = expiresAtMs - nowMs;
+  const isExpired = remainingMs <= 0;
+
+  if (isExpired) {
+    return {
+      resolvedAtMs,
+      expiresAtMs,
+      remainingMs: 0,
+      isExpired: true,
+      countdownText: 'ครบกำหนดลบอัตโนมัติแล้ว',
+      shortCountdownText: 'ครบกำหนดลบแล้ว',
+    };
+  }
+
+  const totalMinutes = Math.floor(remainingMs / 60_000);
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+
+  let countdownText: string;
+  let shortCountdownText: string;
+
+  if (days > 0) {
+    countdownText = `ลบอัตโนมัติในอีก ${days} วัน ${hours} ชม.`;
+    shortCountdownText = `ลบใน ${days} วัน ${hours} ชม.`;
+  } else if (hours > 0) {
+    countdownText = `ลบอัตโนมัติในอีก ${hours} ชม. ${minutes} นาที`;
+    shortCountdownText = `ลบใน ${hours} ชม. ${minutes} น.`;
+  } else if (minutes > 0) {
+    countdownText = `ลบอัตโนมัติในอีก ${minutes} นาที`;
+    shortCountdownText = `ลบใน ${minutes} นาที`;
+  } else {
+    countdownText = 'ลบอัตโนมัติในอีกไม่ถึง 1 นาที';
+    shortCountdownText = 'ลบใน <1 นาที';
+  }
+
+  return {
+    resolvedAtMs,
+    expiresAtMs,
+    remainingMs,
+    isExpired: false,
+    countdownText,
+    shortCountdownText,
+  };
+}
+
 export function getStatusLabel(status: CaseStatus): string {
   switch (status) {
     case 'todo':

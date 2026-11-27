@@ -7,9 +7,10 @@ import {
   Plus,
   Search,
 } from 'lucide-react';
-import { getSafeCaseUrl } from '../lib/caseLink.ts';
+import { resolveCaseLinkDisplay } from '../lib/caseLink.ts';
 import {
   computeAlertStage,
+  computeClosedCaseRetention,
   computeLiveSlaState,
   formatSlaCountdown,
   formatThaiDate,
@@ -69,6 +70,7 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
       const q = searchQuery.trim().toLowerCase();
       const hit =
         c.case_no.toLowerCase().includes(q) ||
+        (c.case_url ?? '').toLowerCase().includes(q) ||
         c.shop_id.toLowerCase().includes(q) ||
         c.issue_summary.toLowerCase().includes(q) ||
         c.details.toLowerCase().includes(q) ||
@@ -170,7 +172,7 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                 type="search"
                 value={searchQuery}
                 onChange={(e) => onSearchChange(e.target.value)}
-                placeholder="ค้นหาลิงก์เคส, ปัญหา, ผู้รับเรื่อง..."
+                placeholder="ค้นหาเลขเคส, ลิงก์เคส, ปัญหา, ผู้รับเรื่อง..."
                 className="w-full rounded-lg border border-slate-300 bg-white pl-9 pr-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:outline-none"
               />
             </div>
@@ -206,7 +208,7 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
-                  <th className="py-3 pl-5 pr-3">ลิงก์เคส / สถานะ</th>
+                  <th className="py-3 pl-5 pr-3">เลขเคส / สถานะ</th>
                   <th className="py-3 px-3">รายละเอียดปัญหา &amp; บันทึก</th>
                   <th className="py-3 px-3">ทีม / ผู้รับเรื่อง</th>
                   <th className="py-3 px-3">SLA (วันครบกำหนด)</th>
@@ -218,26 +220,32 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                   const liveSla = computeLiveSlaState(item.sla_due_at, item.status, nowMs);
                   const alertStage = computeAlertStage(item.sla_due_at, item.status, nowMs);
                   const countdown = formatSlaCountdown(item.sla_due_at, item.status, nowMs);
+                  const closedRetention = computeClosedCaseRetention(
+                    item.resolved_at || item.updated_at,
+                    item.status,
+                    nowMs
+                  );
                   const needsAckNow = needsUserAck(item, nowMs);
                   const userAckedCurrentStage = alertStage !== null && !needsAckNow;
-                  const safeCaseUrl = getSafeCaseUrl(item.case_no);
+                  const caseLink = resolveCaseLinkDisplay(item.case_no, item.case_url);
 
                   return (
                     <tr key={item.id} className="hover:bg-slate-50/80 transition-colors align-top">
                       <td className="py-3.5 pl-5 pr-3 whitespace-nowrap">
-                        {safeCaseUrl ? (
+                        {caseLink.url ? (
                           <a
-                            href={safeCaseUrl}
+                            href={caseLink.url}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 text-xs font-semibold text-blue-700 hover:text-blue-900 hover:underline"
+                            title="คลิกเพื่อเปิดลิงก์เคส"
+                            className="inline-flex items-center gap-1 font-mono text-xs font-semibold text-blue-700 hover:text-blue-900 hover:underline tabular-nums"
                           >
-                            <ExternalLink className="w-3.5 h-3.5 shrink-0" />
-                            <span>ลิงก์ไปที่เคส</span>
+                            <span>{caseLink.label}</span>
+                            <ExternalLink className="w-3 h-3 shrink-0" />
                           </a>
                         ) : (
                           <div className="font-mono text-xs font-semibold text-slate-900 tabular-nums">
-                            {item.case_no}
+                            {caseLink.label}
                           </div>
                         )}
                         <div className="text-xs text-slate-500 mt-1">
@@ -297,6 +305,15 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                             <span className="text-slate-400"> · คุณรับทราบแล้ว</span>
                           )}
                         </div>
+                        {closedRetention && (
+                          <div
+                            className={`text-xs font-medium tabular-nums mt-0.5 ${
+                              closedRetention.isExpired ? 'text-red-700' : 'text-emerald-700'
+                            }`}
+                          >
+                            {closedRetention.countdownText}
+                          </div>
+                        )}
                       </td>
 
                       <td className="py-3.5 pl-3 pr-5 text-right whitespace-nowrap">
