@@ -264,3 +264,18 @@ export interface DashboardSummary {
   assignee_stats: AssigneeStat[];
   server_time: string;
 }
+
+export type WebhookEventType = 'escalation' | 'mention' | 'sla_due' | 'sla_overdue';
+
+export interface TeamWebhookConfig {
+  team_id: string;
+  has_webhook: boolean;
+  masked_url: string;
+  enabled: boolean;
+  events: WebhookEventType[];
+  last_status: 'success' | 'error' | null;
+  last_error: string;
+  last_sent_at: string | null;
+  updated_at: string | null;
+}
+

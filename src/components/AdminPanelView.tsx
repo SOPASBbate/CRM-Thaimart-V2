@@ -1,5 +1,19 @@
-import React, { useState } from 'react';
-import { Eye, EyeOff, KeyRound, Lock, Plus, Trash2, User, UserPlus, Users } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import {
+  AlertCircle,
+  CheckCircle2,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Lock,
+  Plus,
+  Send,
+  Trash2,
+  User,
+  UserPlus,
+  Users,
+  Webhook,
+} from 'lucide-react';
 import {
   createPositionDoc,
   createStaffMemberDoc,
@@ -9,8 +23,25 @@ import {
   deleteTeamDoc,
   updateStaffMemberDoc,
 } from '../lib/firestoreService.ts';
-import { getRoleLabel } from '../lib/sla.ts';
-import type { CaseItem, Position, RoleLevel, StaffEntry, Team, UserPublic } from '../types.ts';
+import { formatThaiDateTime, getRoleLabel } from '../lib/sla.ts';
+import {
+  DEFAULT_WEBHOOK_EVENTS,
+  WEBHOOK_EVENT_LABELS,
+  deleteAdminTeamWebhook,
+  fetchAdminTeamWebhooks,
+  saveAdminTeamWebhook,
+  testAdminTeamWebhook,
+} from '../lib/webhookService.ts';
+import type {
+  CaseItem,
+  Position,
+  RoleLevel,
+  StaffEntry,
+  Team,
+  TeamWebhookConfig,
+  UserPublic,
+  WebhookEventType,
+} from '../types.ts';
 
 const FIREBASE_PROVIDERS_URL =
   'https://console.firebase.google.com/u/0/project/crm-desk-1a741/authentication/providers';
@@ -30,7 +61,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   staffList,
   cases,
 }) => {
-  const [tab, setTab] = useState<'users' | 'teams' | 'positions'>('users');
+  const [tab, setTab] = useState<'users' | 'teams' | 'positions' | 'webhooks'>('users');
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
@@ -53,6 +84,36 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   // Add Position state
   const [newPosName, setNewPosName] = useState('');
   const [newPosLevel, setNewPosLevel] = useState<RoleLevel>('agent');
+
+  // Team Webhooks state
+  const [webhooks, setWebhooks] = useState<TeamWebhookConfig[]>([]);
+  const [loadingWebhooks, setLoadingWebhooks] = useState(false);
+  const [editingWebhookTeamId, setEditingWebhookTeamId] = useState<string | null>(null);
+  const [whUrlInput, setWhUrlInput] = useState('');
+  const [whEnabled, setWhEnabled] = useState(true);
+  const [whEvents, setWhEvents] = useState<WebhookEventType[]>([...DEFAULT_WEBHOOK_EVENTS]);
+  const [whBusyTeamId, setWhBusyTeamId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (tab !== 'webhooks') return;
+    let active = true;
+    setLoadingWebhooks(true);
+    fetchAdminTeamWebhooks()
+      .then((list) => {
+        if (active) setWebhooks(list);
+      })
+      .catch((err) => {
+        if (active) {
+          setError(err instanceof Error ? err.message : 'ไม่สามารถโหลดการตั้งค่า Webhook ได้');
+        }
+      })
+      .finally(() => {
+        if (active) setLoadingWebhooks(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [tab]);
 
   const openCreateUser = () => {
     setEditingStaff(null);
@@ -195,6 +256,103 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     }
   };
 
+  const openEditWebhook = (team: Team) => {
+    const existing = webhooks.find((w) => w.team_id === team.id);
+    setEditingWebhookTeamId(team.id);
+    setWhUrlInput('');
+    setWhEnabled(existing ? existing.enabled : true);
+    setWhEvents(
+      existing && existing.events.length > 0 ? [...existing.events] : [...DEFAULT_WEBHOOK_EVENTS]
+    );
+    setError(null);
+    setSuccessMsg(null);
+  };
+
+  const toggleWebhookEvent = (ev: WebhookEventType) => {
+    setWhEvents((prev) =>
+      prev.includes(ev) ? prev.filter((item) => item !== ev) : [...prev, ev]
+    );
+  };
+
+  const handleSaveWebhook = async (e: React.FormEvent, team: Team) => {
+    e.preventDefault();
+    setError(null);
+    setSuccessMsg(null);
+
+    const existing = webhooks.find((w) => w.team_id === team.id);
+    const trimmedUrl = whUrlInput.trim();
+    if (!existing?.has_webhook && !trimmedUrl) {
+      setError('กรุณาระบุ Webhook URL (HTTPS)');
+      return;
+    }
+    if (whEvents.length === 0) {
+      setError('กรุณาเลือกเหตุการณ์แจ้งเตือนอย่างน้อย 1 รายการ');
+      return;
+    }
+
+    setWhBusyTeamId(team.id);
+    try {
+      const saved = await saveAdminTeamWebhook(team.id, {
+        ...(trimmedUrl ? { webhook_url: trimmedUrl } : {}),
+        enabled: whEnabled,
+        events: whEvents,
+      });
+      setWebhooks((prev) => {
+        const filtered = prev.filter((w) => w.team_id !== team.id);
+        return [...filtered, saved];
+      });
+      setEditingWebhookTeamId(null);
+      setWhUrlInput('');
+      setSuccessMsg(`บันทึกการตั้งค่า Webhook สำหรับทีม "${team.name}" เรียบร้อยแล้ว`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'ไม่สามารถบันทึกการตั้งค่า Webhook ได้');
+    } finally {
+      setWhBusyTeamId(null);
+    }
+  };
+
+  const handleTestWebhook = async (team: Team) => {
+    setError(null);
+    setSuccessMsg(null);
+    setWhBusyTeamId(team.id);
+    try {
+      const res = await testAdminTeamWebhook(team.id, team.name);
+      if (res.webhook) {
+        setWebhooks((prev) => {
+          const filtered = prev.filter((w) => w.team_id !== team.id);
+          return [...filtered, res.webhook!];
+        });
+      }
+      if (res.ok) {
+        setSuccessMsg(`ส่งข้อความทดสอบเข้าห้องแชทของทีม "${team.name}" สำเร็จแล้ว`);
+      } else {
+        setError(res.error || `ทดสอบส่ง Webhook ของทีม "${team.name}" ไม่สำเร็จ`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'ไม่สามารถทดสอบส่ง Webhook ได้');
+    } finally {
+      setWhBusyTeamId(null);
+    }
+  };
+
+  const handleDeleteWebhook = async (team: Team) => {
+    setError(null);
+    setSuccessMsg(null);
+    setWhBusyTeamId(team.id);
+    try {
+      await deleteAdminTeamWebhook(team.id);
+      setWebhooks((prev) => prev.filter((w) => w.team_id !== team.id));
+      if (editingWebhookTeamId === team.id) {
+        setEditingWebhookTeamId(null);
+      }
+      setSuccessMsg(`ลบการเชื่อมต่อ Webhook ของทีม "${team.name}" เรียบร้อยแล้ว`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'ไม่สามารถลบ Webhook ได้');
+    } finally {
+      setWhBusyTeamId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -218,7 +376,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       </div>
 
       {/* Sub-Navigation Segmented Tabs */}
-      <div className="inline-flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
+      <div className="inline-flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-lg">
         <button
           type="button"
           onClick={() => {
@@ -259,6 +417,20 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         >
           <KeyRound className="w-3.5 h-3.5" />
           <span>ตำแหน่งและสิทธิ์ ({positions.length})</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setTab('webhooks');
+            setError(null);
+            setSuccessMsg(null);
+          }}
+          className={`inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+            tab === 'webhooks' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+          }`}
+        >
+          <Webhook className="w-3.5 h-3.5" />
+          <span>Webhook ห้องแชท</span>
         </button>
       </div>
 
@@ -673,6 +845,222 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {/* WEBHOOKS TAB */}
+      {tab === 'webhooks' && (
+        <div className="space-y-5">
+          <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+                <Webhook className="w-4 h-4 text-blue-700" />
+                <span>ส่งแจ้งเตือนเข้าห้องแชทของทีม (Webhook Integration)</span>
+              </h2>
+              <p className="text-xs text-slate-500">
+                รองรับ Discord, Slack, Google Chat หรือ Webhook URL (HTTPS) เช่น n8n / LINE Messaging Proxy
+                โดยระบบจะจัดรูปแบบข้อความให้เหมาะสมกับปลายทางอัตโนมัติ และเก็บรักษา Webhook URL อย่างปลอดภัยบนเซิร์ฟเวอร์
+              </p>
+            </div>
+          </div>
+
+          {loadingWebhooks ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-sm text-slate-500">
+              กำลังโหลดการตั้งค่า Webhook...
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {teams.map((t) => {
+                const cfg = webhooks.find((w) => w.team_id === t.id);
+                const isEditing = editingWebhookTeamId === t.id;
+                const isBusy = whBusyTeamId === t.id;
+                const memberCount = staffList.filter((s) => s.team_id === t.id).length;
+
+                return (
+                  <div
+                    key={t.id}
+                    className="bg-white border border-slate-200 rounded-xl p-5 space-y-4"
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                      <div className="space-y-1.5 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2.5">
+                          <span className="text-sm font-semibold text-slate-900">{t.name}</span>
+                          <span className="text-xs text-slate-400">({memberCount} คน)</span>
+                          {cfg?.has_webhook ? (
+                            <span
+                              className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-xs font-medium ${
+                                cfg.enabled
+                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                  : 'bg-slate-100 text-slate-600 border border-slate-200'
+                              }`}
+                            >
+                              {cfg.enabled ? 'เปิดใช้งาน' : 'ปิดชั่วคราว'}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center rounded px-2 py-0.5 text-xs font-medium bg-slate-100 text-slate-500 border border-slate-200">
+                              ยังไม่ได้เชื่อมต่อ
+                            </span>
+                          )}
+                        </div>
+
+                        {cfg?.has_webhook && (
+                          <div className="space-y-1.5">
+                            <div className="font-mono text-xs text-slate-600 break-all">
+                              {cfg.masked_url}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {cfg.events.map((ev) => (
+                                <span
+                                  key={ev}
+                                  className="rounded border border-blue-200 bg-blue-50 px-2 py-0.5 text-xs text-blue-800"
+                                >
+                                  {WEBHOOK_EVENT_LABELS[ev] || ev}
+                                </span>
+                              ))}
+                            </div>
+                            {cfg.last_status && (
+                              <div className="flex items-center gap-1.5 text-xs pt-0.5">
+                                {cfg.last_status === 'success' ? (
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                ) : (
+                                  <AlertCircle className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                                )}
+                                <span
+                                  className={
+                                    cfg.last_status === 'success' ? 'text-emerald-700' : 'text-red-700'
+                                  }
+                                >
+                                  {cfg.last_status === 'success'
+                                    ? 'ส่งล่าสุดสำเร็จ'
+                                    : cfg.last_error || 'ส่งล่าสุดไม่สำเร็จ'}
+                                </span>
+                                {cfg.last_sent_at && (
+                                  <span className="text-slate-400">
+                                    · {formatThaiDateTime(cfg.last_sent_at)}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() =>
+                            isEditing ? setEditingWebhookTeamId(null) : openEditWebhook(t)
+                          }
+                          className="rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-60 px-3 py-1.5 text-xs font-medium text-slate-700 cursor-pointer"
+                        >
+                          {isEditing ? 'ปิดฟอร์ม' : cfg?.has_webhook ? 'แก้ไข Webhook' : 'ตั้งค่า Webhook'}
+                        </button>
+
+                        {cfg?.has_webhook && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => void handleTestWebhook(t)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 hover:bg-blue-100 disabled:opacity-60 px-3 py-1.5 text-xs font-medium text-blue-800 cursor-pointer"
+                            >
+                              <Send className="w-3.5 h-3.5" />
+                              <span>{isBusy ? 'กำลังส่ง...' : 'ทดสอบส่ง'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => void handleDeleteWebhook(t)}
+                              aria-label={`ลบ Webhook ทีม ${t.name}`}
+                              className="rounded-lg border border-red-200 bg-white hover:bg-red-50 disabled:opacity-60 p-1.5 text-red-700 cursor-pointer"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {isEditing && (
+                      <form
+                        onSubmit={(e) => void handleSaveWebhook(e, t)}
+                        className="border-t border-slate-200 pt-4 space-y-4"
+                      >
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1">
+                            Webhook URL (ต้องเป็น HTTPS)
+                          </label>
+                          <input
+                            type="url"
+                            value={whUrlInput}
+                            onChange={(e) => setWhUrlInput(e.target.value)}
+                            placeholder={
+                              cfg?.has_webhook
+                                ? 'เว้นว่างไว้หากใช้ URL เดิมที่บันทึกไว้ หรือวาง URL ใหม่เพื่อเปลี่ยน'
+                                : 'https://discord.com/api/webhooks/... หรือ Slack / Google Chat / n8n'
+                            }
+                            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 font-mono focus:border-blue-600 focus:outline-none"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <div className="text-xs font-medium text-slate-700">
+                            เหตุการณ์ที่ต้องการส่งแจ้งเตือนเข้าห้องแชท
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                            {(Object.keys(WEBHOOK_EVENT_LABELS) as WebhookEventType[]).map((ev) => (
+                              <label
+                                key={ev}
+                                className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 cursor-pointer hover:bg-slate-100"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={whEvents.includes(ev)}
+                                  onChange={() => toggleWebhookEvent(ev)}
+                                  className="rounded border-slate-300 text-blue-700 focus:ring-blue-600"
+                                />
+                                <span>{WEBHOOK_EVENT_LABELS[ev]}</span>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+                          <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={whEnabled}
+                              onChange={(e) => setWhEnabled(e.target.checked)}
+                              className="rounded border-slate-300 text-blue-700 focus:ring-blue-600"
+                            />
+                            <span>เปิดใช้งานการส่ง Webhook ของทีมนี้</span>
+                          </label>
+
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setEditingWebhookTeamId(null)}
+                              className="rounded-lg border border-slate-300 bg-white hover:bg-slate-50 px-4 py-2 text-xs font-medium text-slate-700 cursor-pointer"
+                            >
+                              ยกเลิก
+                            </button>
+                            <button
+                              type="submit"
+                              disabled={isBusy}
+                              className="rounded-lg bg-blue-700 hover:bg-blue-800 disabled:opacity-60 px-4 py-2 text-xs font-medium text-white cursor-pointer"
+                            >
+                              {isBusy ? 'กำลังบันทึก...' : 'บันทึก Webhook'}
+                            </button>
+                          </div>
+                        </div>
+                      </form>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -3,6 +3,8 @@ import { onAuthStateChanged } from 'firebase/auth';
 import {
   AlertTriangle,
   ArrowRightLeft,
+  BellOff,
+  BellRing,
   CheckSquare,
   KeyRound,
   LayoutDashboard,
@@ -23,6 +25,16 @@ import { LoginView } from './components/LoginView.tsx';
 import { NoteNotificationBell } from './components/NoteNotificationBell.tsx';
 import { SlaAlertModal } from './components/SlaAlertModal.tsx';
 import { playInternalNoteChime, unlockAudio } from './lib/bell.ts';
+import {
+  getBrowserNotificationState,
+  isWindowInBackground,
+  requestBrowserNotificationPermission,
+  sendBrowserNotification,
+  setBrowserNotificationOptIn,
+  updateDocumentAlertTitle,
+  type BrowserNotificationState,
+} from './lib/browserNotifications.ts';
+import { resolveCaseLinkDisplay } from './lib/caseLink.ts';
 import { auth } from './lib/firebase.ts';
 import {
   acceptCaseEscalationDoc,
@@ -50,8 +62,15 @@ import {
   updateCaseDoc,
   type RawCaseDoc,
 } from './lib/firestoreService.ts';
-import { computeAlertStage, computeClosedCaseRetention, needsUserAck } from './lib/sla.ts';
+import {
+  computeAlertStage,
+  computeClosedCaseRetention,
+  needsUserAck,
+  toLocalDateInput,
+} from './lib/sla.ts';
+import { dispatchTeamWebhook } from './lib/webhookService.ts';
 import type {
+  AlertStage,
   CaseEscalation,
   CaseItem,
   CaseStatus,
@@ -102,12 +121,21 @@ export default function App() {
   const [escalationAlertNonce, setEscalationAlertNonce] = useState(0);
   const [changePasswordOpen, setChangePasswordOpen] = useState(false);
 
+  // Browser Notification state
+  const [browserNotifState, setBrowserNotifState] = useState<BrowserNotificationState>(() =>
+    getBrowserNotificationState()
+  );
+  const [browserNotifNotice, setBrowserNotifNotice] = useState<string | null>(null);
+
   // Track which alert signatures were already triggered automatically
   const seenAlertKeysRef = useRef<Set<string>>(new Set());
+  const seenBrowserSlaKeysRef = useRef<Set<string>>(new Set());
+  const seenWebhookSlaKeysRef = useRef<Set<string>>(new Set());
   const seenEscalationKeysRef = useRef<Set<string>>(new Set());
   const noteNotifsInitializedRef = useRef(false);
   const seenNoteNotifIdsRef = useRef<Set<string>>(new Set());
   const deletingExpiredIdsRef = useRef<Set<string>>(new Set());
+  const casesRef = useRef<CaseItem[]>([]);
 
   if (firestoreError) {
     throw firestoreError;
@@ -132,10 +160,13 @@ export default function App() {
     setAlertModalOpen(false);
     setEscalationModalOpen(false);
     seenAlertKeysRef.current.clear();
+    seenBrowserSlaKeysRef.current.clear();
+    seenWebhookSlaKeysRef.current.clear();
     seenEscalationKeysRef.current.clear();
     noteNotifsInitializedRef.current = false;
     seenNoteNotifIdsRef.current.clear();
     deletingExpiredIdsRef.current.clear();
+    updateDocumentAlertTitle(0);
     setActiveView('dashboard');
   }, []);
 
@@ -156,6 +187,8 @@ export default function App() {
         const profile = await resolveAuthenticatedUser(firebaseUser);
         if (!active) return;
         seenAlertKeysRef.current.clear();
+        seenBrowserSlaKeysRef.current.clear();
+        seenWebhookSlaKeysRef.current.clear();
         seenEscalationKeysRef.current.clear();
         noteNotifsInitializedRef.current = false;
         seenNoteNotifIdsRef.current.clear();
@@ -220,11 +253,13 @@ export default function App() {
           }
           let hasNewUnread = false;
           let hasNewMention = false;
+          const newUnreadItems: NoteNotification[] = [];
           for (const item of items) {
             if (!seenNoteNotifIdsRef.current.has(item.id)) {
               seenNoteNotifIdsRef.current.add(item.id);
               if (!item.is_read) {
                 hasNewUnread = true;
+                newUnreadItems.push(item);
                 if (item.notification_type === 'mention') {
                   hasNewMention = true;
                 }
@@ -233,6 +268,29 @@ export default function App() {
           }
           if (hasNewUnread) {
             void playInternalNoteChime(hasNewMention);
+            for (const item of newUnreadItems.slice(0, 3)) {
+              const caseDisplay = resolveCaseLinkDisplay(item.case_no, item.case_url).label;
+              const title =
+                item.notification_type === 'mention'
+                  ? item.mentioned_team_name
+                    ? `แท็กทีม @${item.mentioned_team_name}`
+                    : 'คุณถูก @Mention ในเคส'
+                  : 'Internal Note ใหม่';
+              sendBrowserNotification({
+                title,
+                body: `${item.author_name} · ${caseDisplay}\n${item.note_preview || item.issue_summary}`,
+                tag: `note-${item.id}`,
+                requireInteraction: item.notification_type === 'mention',
+                onClick: () => {
+                  void markNoteNotificationRead(currentUser.uid, item.id).catch(() => {});
+                  const matched = casesRef.current.find((c) => c.id === item.case_id);
+                  if (matched) {
+                    setEditingCase(matched);
+                    setCaseModalOpen(true);
+                  }
+                },
+              });
+            }
           }
         },
         onErr
@@ -267,6 +325,10 @@ export default function App() {
   const cases = useMemo(() => {
     return enrichCasesForUser(rawCases, myCaseAcks, nowMs);
   }, [rawCases, myCaseAcks, nowMs]);
+
+  useEffect(() => {
+    casesRef.current = cases;
+  }, [cases]);
 
   const summary = useMemo(() => {
     if (!currentUser) return null;
@@ -305,7 +367,7 @@ export default function App() {
     return cases.filter((c) => needsUserAck(c, nowMs));
   }, [cases, nowMs]);
 
-  // Trigger SLA Alert Popup immediately when a new stage (due_today or overdue) enters
+  // Trigger SLA Alert Popup & Browser Notification immediately when a new stage enters
   useEffect(() => {
     if (!currentUser) return;
 
@@ -315,6 +377,7 @@ export default function App() {
     }
 
     let hasNewAlert = false;
+    const newlyBrowserSla: { item: CaseItem; stage: AlertStage }[] = [];
     for (const item of unacknowledgedAlerts) {
       const stage = computeAlertStage(item.sla_due_at, item.status, nowMs);
       if (!stage) continue;
@@ -323,11 +386,45 @@ export default function App() {
         seenAlertKeysRef.current.add(key);
         hasNewAlert = true;
       }
+      if (!seenBrowserSlaKeysRef.current.has(key)) {
+        seenBrowserSlaKeysRef.current.add(key);
+        newlyBrowserSla.push({ item, stage });
+      }
     }
 
     if (hasNewAlert) {
       setAlertModalOpen(true);
       setAlertNonce((n) => n + 1);
+    }
+
+    if (newlyBrowserSla.length === 1) {
+      const { item, stage } = newlyBrowserSla[0];
+      const caseDisplay = resolveCaseLinkDisplay(item.case_no, item.case_url).label;
+      sendBrowserNotification({
+        title: stage === 'overdue' ? 'เคสเกินกำหนด SLA!' : 'เคสครบกำหนด SLA วันนี้',
+        body: `${caseDisplay} · ${item.issue_summary}`,
+        tag: `sla-${item.id}-${stage}`,
+        requireInteraction: true,
+        onClick: () => {
+          setEditingCase(item);
+          setCaseModalOpen(true);
+        },
+      });
+    } else if (newlyBrowserSla.length > 1) {
+      const overdueCount = newlyBrowserSla.filter((x) => x.stage === 'overdue').length;
+      const dueCount = newlyBrowserSla.length - overdueCount;
+      const parts: string[] = [];
+      if (overdueCount > 0) parts.push(`เกินกำหนด ${overdueCount} เคส`);
+      if (dueCount > 0) parts.push(`ครบกำหนดวันนี้ ${dueCount} เคส`);
+      sendBrowserNotification({
+        title: `แจ้งเตือน SLA (${newlyBrowserSla.length} เคส)`,
+        body: `${parts.join(' · ')} — คลิกเพื่อเปิดรายการแจ้งเตือน`,
+        tag: 'sla-batch-alert',
+        requireInteraction: true,
+        onClick: () => {
+          setAlertModalOpen(true);
+        },
+      });
     }
   }, [currentUser, unacknowledgedAlerts, nowMs]);
 
@@ -340,14 +437,70 @@ export default function App() {
     const repeatTimer = setInterval(() => {
       setAlertModalOpen(true);
       setAlertNonce((n) => n + 1);
+      if (isWindowInBackground()) {
+        sendBrowserNotification({
+          title: `แจ้งเตือน SLA (${unacknowledgedAlerts.length} เคสรอกดรับทราบ)`,
+          body: 'กรุณาคลิกเพื่อกลับมาตรวจสอบและกดรับทราบเคสใน CRM Desk',
+          tag: 'sla-repeat-reminder',
+          requireInteraction: true,
+          onClick: () => {
+            setAlertModalOpen(true);
+          },
+        });
+      }
     }, 30000);
 
     return () => clearInterval(repeatTimer);
   }, [currentUser, unacknowledgedAlerts.length, caseModalOpen]);
 
-  const totalEscalationAlerts = incomingEscalations.length + rejectedEscalations.length;
+  // Dispatch deduplicated team chat webhooks when cases enter due_today or overdue SLA
+  useEffect(() => {
+    if (!currentUser || loadingData || cases.length === 0) return;
 
-  // Trigger Escalation Alert Popup immediately on incoming handoff or returned rejection
+    const todayStr = toLocalDateInput(nowMs);
+    for (const c of cases) {
+      const stage = computeAlertStage(c.sla_due_at, c.status, nowMs);
+      if (!stage || !c.team_id) continue;
+      const eventType = stage === 'overdue' ? 'sla_overdue' : 'sla_due';
+      const dateKey = stage === 'overdue' ? todayStr : toLocalDateInput(c.sla_due_at) || todayStr;
+      const dedupKey = `${eventType}:${c.id}:${dateKey}`;
+      if (seenWebhookSlaKeysRef.current.has(dedupKey)) continue;
+      seenWebhookSlaKeysRef.current.add(dedupKey);
+
+      void dispatchTeamWebhook({
+        eventType,
+        teamIds: [c.team_id],
+        dedupKey,
+        caseId: c.id,
+        caseNo: c.case_no,
+        caseUrl: c.case_url ?? '',
+        issueSummary: c.issue_summary,
+        slaDueAt: toLocalDateInput(c.sla_due_at) || c.sla_due_at,
+        actorName: c.assignee_name || c.team_name,
+        extraInfo: stage === 'overdue' ? 'เกินกำหนด SLA แล้ว กรุณาเร่งติดตาม' : 'ครบกำหนด SLA วันนี้',
+      });
+    }
+  }, [currentUser, loadingData, cases, nowMs]);
+
+  const totalEscalationAlerts = incomingEscalations.length + rejectedEscalations.length;
+  const unreadNoteNotifCount = useMemo(
+    () => noteNotifications.filter((n) => !n.is_read).length,
+    [noteNotifications]
+  );
+
+  // Sync pending alert count in the browser tab title
+  useEffect(() => {
+    if (!currentUser) {
+      updateDocumentAlertTitle(0);
+      return;
+    }
+    updateDocumentAlertTitle(
+      unacknowledgedAlerts.length + totalEscalationAlerts + unreadNoteNotifCount
+    );
+    return () => updateDocumentAlertTitle(0);
+  }, [currentUser, unacknowledgedAlerts.length, totalEscalationAlerts, unreadNoteNotifCount]);
+
+  // Trigger Escalation Alert Popup & Browser Notification immediately
   useEffect(() => {
     if (!currentUser) return;
 
@@ -362,6 +515,16 @@ export default function App() {
       if (!seenEscalationKeysRef.current.has(key)) {
         seenEscalationKeysRef.current.add(key);
         hasNew = true;
+        const caseDisplay = resolveCaseLinkDisplay(esc.case_no, esc.case_url).label;
+        sendBrowserNotification({
+          title: `รับส่งต่อเคสใหม่จาก ${esc.from_user_name}`,
+          body: `${caseDisplay} · ${esc.issue_summary}`,
+          tag: `esc-inc-${esc.id}`,
+          requireInteraction: true,
+          onClick: () => {
+            setEscalationModalOpen(true);
+          },
+        });
       }
     }
     for (const esc of rejectedEscalations) {
@@ -369,6 +532,16 @@ export default function App() {
       if (!seenEscalationKeysRef.current.has(key)) {
         seenEscalationKeysRef.current.add(key);
         hasNew = true;
+        const caseDisplay = resolveCaseLinkDisplay(esc.case_no, esc.case_url).label;
+        sendBrowserNotification({
+          title: `เคสส่งต่อถูกตีกลับโดย ${esc.to_user_name}`,
+          body: `${caseDisplay} · ${esc.reject_reason || esc.issue_summary}`,
+          tag: `esc-rej-${esc.id}`,
+          requireInteraction: true,
+          onClick: () => {
+            setEscalationModalOpen(true);
+          },
+        });
       }
     }
 
@@ -387,6 +560,17 @@ export default function App() {
     const repeatTimer = setInterval(() => {
       setEscalationModalOpen(true);
       setEscalationAlertNonce((n) => n + 1);
+      if (isWindowInBackground()) {
+        sendBrowserNotification({
+          title: `รอการตอบรับส่งต่อเคส (${totalEscalationAlerts} รายการ)`,
+          body: 'กรุณาคลิกเพื่อเปิดหน้าต่างตอบรับหรือรับทราบเคสส่งต่อ',
+          tag: 'esc-repeat-reminder',
+          requireInteraction: true,
+          onClick: () => {
+            setEscalationModalOpen(true);
+          },
+        });
+      }
     }, 30000);
 
     return () => clearInterval(repeatTimer);
@@ -451,6 +635,43 @@ export default function App() {
   const handleClearReadNoteNotifications = async () => {
     if (!currentUser) return;
     await clearReadNoteNotifications(currentUser.uid, noteNotifications);
+  };
+
+  const handleToggleBrowserNotifications = async () => {
+    const current = getBrowserNotificationState();
+    setBrowserNotifState(current);
+
+    if (!current.supported) {
+      setBrowserNotifNotice('เบราว์เซอร์นี้ไม่รองรับการแจ้งเตือนข้ามแท็บ');
+      return;
+    }
+    if (current.permission === 'denied') {
+      setBrowserNotifNotice(
+        'เบราว์เซอร์บล็อกสิทธิ์แจ้งเตือนอยู่ กรุณาคลิกไอคอนตั้งค่าข้าง URL เพื่อเปิด Notifications สำหรับเว็บนี้'
+      );
+      return;
+    }
+    if (current.permission === 'default') {
+      const next = await requestBrowserNotificationPermission();
+      setBrowserNotifState(next);
+      if (next.permission === 'granted' && next.enabled) {
+        setBrowserNotifNotice(null);
+        sendBrowserNotification({
+          title: 'เปิดการแจ้งเตือนข้ามแท็บแล้ว',
+          body: 'ระบบจะแจ้งเตือนเมื่อมีการส่งต่อเคส ถูก @Mention หรือเคสใกล้/เกิน SLA',
+          tag: 'browser-notif-welcome',
+        });
+      } else {
+        setBrowserNotifNotice(
+          'ยังไม่ได้รับอนุญาตให้แสดง Browser Notification (สามารถกดปุ่มอีกครั้งเมื่อพร้อม)'
+        );
+      }
+      return;
+    }
+
+    const next = setBrowserNotificationOptIn(!current.enabled);
+    setBrowserNotifState(next);
+    setBrowserNotifNotice(null);
   };
 
   if (!currentUser) {
@@ -684,6 +905,40 @@ export default function App() {
               <span>เพิ่มเคส</span>
             </button>
 
+            <button
+              type="button"
+              onClick={() => void handleToggleBrowserNotifications()}
+              title={
+                !browserNotifState.supported
+                  ? 'เบราว์เซอร์ไม่รองรับแจ้งเตือนข้ามแท็บ'
+                  : browserNotifState.permission === 'denied'
+                    ? 'เบราว์เซอร์บล็อกสิทธิ์แจ้งเตือน (คลิกเพื่อดูวิธีเปิด)'
+                    : browserNotifState.enabled
+                      ? 'แจ้งเตือนข้ามแท็บเปิดอยู่ (คลิกเพื่อพักชั่วคราว)'
+                      : 'เปิดแจ้งเตือนข้ามแท็บ (Browser Notification)'
+              }
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                browserNotifState.enabled
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                  : browserNotifState.permission === 'denied'
+                    ? 'border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100'
+                    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+              }`}
+            >
+              {browserNotifState.enabled ? (
+                <BellRing className="w-3.5 h-3.5 shrink-0" />
+              ) : (
+                <BellOff className="w-3.5 h-3.5 shrink-0" />
+              )}
+              <span className="hidden sm:inline">
+                {browserNotifState.enabled
+                  ? 'แจ้งเตือนข้ามแท็บ: เปิด'
+                  : browserNotifState.permission === 'denied'
+                    ? 'แจ้งเตือนถูกบล็อก'
+                    : 'แจ้งเตือนข้ามแท็บ'}
+              </span>
+            </button>
+
             <NoteNotificationBell
               notifications={noteNotifications}
               onSelectNotification={handleSelectNoteNotification}
@@ -692,6 +947,20 @@ export default function App() {
             />
           </div>
         </header>
+
+        {browserNotifNotice && (
+          <div className="bg-amber-50 border-b border-amber-200 px-4 sm:px-8 py-2 flex items-center justify-between gap-3 text-xs text-amber-900">
+            <span>{browserNotifNotice}</span>
+            <button
+              type="button"
+              onClick={() => setBrowserNotifNotice(null)}
+              aria-label="ปิดข้อความแจ้งเตือน"
+              className="p-1 rounded hover:bg-amber-100 text-amber-700 cursor-pointer shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Main Viewport */}
         <main className="flex-1 p-4 sm:p-8 max-w-[1440px] w-full mx-auto">

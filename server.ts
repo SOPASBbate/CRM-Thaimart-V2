@@ -1,8 +1,10 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -117,7 +119,47 @@ const VIDEO_EXTS = new Set([
   '.avi',
 ]);
 
-function loadFirebaseApiKey(): string {
+interface FirebaseServerConfig {
+  apiKey: string;
+  projectId: string;
+  firestoreDatabaseId: string;
+}
+
+interface VerifiedFirebaseToken {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  idToken: string;
+}
+
+interface VerifiedStaffUser extends VerifiedFirebaseToken {
+  role: string;
+  teamId: string;
+  displayName: string;
+}
+
+interface TeamWebhookRow {
+  team_id: string;
+  webhook_url: string;
+  enabled: number;
+  events_json: string;
+  last_status: string | null;
+  last_error: string | null;
+  last_sent_at: string | null;
+  updated_by: string;
+  updated_at: string;
+}
+
+type WebhookEventType = 'escalation' | 'mention' | 'sla_due' | 'sla_overdue';
+const ALLOWED_WEBHOOK_EVENTS = new Set<WebhookEventType>([
+  'escalation',
+  'mention',
+  'sla_due',
+  'sla_overdue',
+]);
+const DEDUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+function loadFirebaseServerConfig(): FirebaseServerConfig {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
     path.resolve(process.cwd(), 'firebase-applet-config.json'),
@@ -126,19 +168,25 @@ function loadFirebaseApiKey(): string {
   for (const cfgPath of candidates) {
     try {
       const raw = fs.readFileSync(cfgPath, 'utf8');
-      const parsed = JSON.parse(raw) as { apiKey?: string };
-      if (parsed.apiKey) return parsed.apiKey;
+      const parsed = JSON.parse(raw) as Partial<FirebaseServerConfig>;
+      if (parsed.apiKey && parsed.projectId && parsed.firestoreDatabaseId) {
+        return {
+          apiKey: parsed.apiKey,
+          projectId: parsed.projectId,
+          firestoreDatabaseId: parsed.firestoreDatabaseId,
+        };
+      }
     } catch {
       // try next candidate
     }
   }
-  return '';
+  return { apiKey: '', projectId: '', firestoreDatabaseId: '' };
 }
 
-async function verifyFirebaseIdToken(
+async function verifyFirebaseTokenDetails(
   authHeader: string | undefined,
   firebaseApiKey: string
-): Promise<string | null> {
+): Promise<VerifiedFirebaseToken | null> {
   if (!authHeader || !authHeader.startsWith('Bearer ') || !firebaseApiKey) {
     return null;
   }
@@ -155,11 +203,378 @@ async function verifyFirebaseIdToken(
       }
     );
     if (!resp.ok) return null;
-    const data = (await resp.json()) as { users?: Array<{ localId?: string }> };
-    const uid = data.users?.[0]?.localId;
-    return typeof uid === 'string' && VALID_ID_RE.test(uid) ? uid : null;
+    const data = (await resp.json()) as {
+      users?: Array<{ localId?: string; email?: string; emailVerified?: boolean }>;
+    };
+    const user = data.users?.[0];
+    const uid = user?.localId;
+    if (typeof uid !== 'string' || !VALID_ID_RE.test(uid)) return null;
+    return {
+      uid,
+      email: String(user?.email ?? '').trim().toLowerCase(),
+      emailVerified: Boolean(user?.emailVerified),
+      idToken,
+    };
   } catch {
     return null;
+  }
+}
+
+async function verifyFirebaseIdToken(
+  authHeader: string | undefined,
+  firebaseApiKey: string
+): Promise<string | null> {
+  const details = await verifyFirebaseTokenDetails(authHeader, firebaseApiKey);
+  return details?.uid ?? null;
+}
+
+async function fetchActiveStaffProfile(
+  tokenInfo: VerifiedFirebaseToken,
+  cfg: FirebaseServerConfig
+): Promise<VerifiedStaffUser | null> {
+  if (!cfg.projectId || !cfg.firestoreDatabaseId) return null;
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+      cfg.projectId
+    )}/databases/${encodeURIComponent(cfg.firestoreDatabaseId)}/documents/users/${encodeURIComponent(
+      tokenInfo.uid
+    )}`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${tokenInfo.idToken}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return null;
+    const docData = (await resp.json()) as {
+      fields?: Record<string, { stringValue?: string; booleanValue?: boolean }>;
+    };
+    const fields = docData.fields;
+    if (!fields || fields.is_active?.booleanValue !== true) return null;
+    return {
+      ...tokenInfo,
+      role: String(fields.role?.stringValue ?? 'agent'),
+      teamId: String(fields.team_id?.stringValue ?? ''),
+      displayName: String(fields.display_name?.stringValue ?? ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function isFirebaseAdminUser(
+  tokenInfo: VerifiedFirebaseToken,
+  cfg: FirebaseServerConfig
+): Promise<boolean> {
+  if (tokenInfo.emailVerified && tokenInfo.email === 'tanawin.wat@gmail.com') {
+    return true;
+  }
+  if (!cfg.projectId || !cfg.firestoreDatabaseId) return false;
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+      cfg.projectId
+    )}/databases/${encodeURIComponent(cfg.firestoreDatabaseId)}/documents/admins/${encodeURIComponent(
+      tokenInfo.uid
+    )}`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${tokenInfo.idToken}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+function isPrivateOrReservedIpv4(ip: string): boolean {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return true;
+  }
+  const [a, b, c] = parts;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+  if (a === 169 && b === 254) return true; // Link-local / cloud metadata 169.254.0.0/16
+  if (a === 172 && b >= 16 && b <= 31) return true; // Private 172.16.0.0/12
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+  if (a === 192 && b === 168) return true; // Private 192.168.0.0/16
+  if (a === 198 && (b === 18 || b === 19)) return true; // Benchmark
+  if (a === 198 && b === 51 && c === 100) return true;
+  if (a === 203 && b === 0 && c === 113) return true;
+  if (a >= 224) return true; // Multicast & reserved
+  return false;
+}
+
+function isPrivateOrReservedIp(ip: string): boolean {
+  const clean = ip.trim().toLowerCase();
+  const ipVersion = net.isIP(clean);
+  if (ipVersion === 4) {
+    return isPrivateOrReservedIpv4(clean);
+  }
+  if (ipVersion === 6) {
+    if (clean === '::' || clean === '::1') return true;
+    if (clean.startsWith('fc') || clean.startsWith('fd')) return true; // ULA fc00::/7
+    if (clean.startsWith('fe8') || clean.startsWith('fe9') || clean.startsWith('fea') || clean.startsWith('feb')) {
+      return true; // Link-local fe80::/10
+    }
+    if (clean.startsWith('ff')) return true; // Multicast
+    if (clean.startsWith('::ffff:')) {
+      const mapped = clean.slice('::ffff:'.length);
+      if (net.isIP(mapped) === 4) {
+        return isPrivateOrReservedIpv4(mapped);
+      }
+      return true;
+    }
+    return false;
+  }
+  return true;
+}
+
+async function validateAndCheckWebhookUrl(rawUrl: string): Promise<URL> {
+  const trimmed = rawUrl.trim();
+  if (!trimmed || trimmed.length > 1024) {
+    throw new Error('URL ของ Webhook ต้องมีความยาวไม่เกิน 1,024 ตัวอักษร');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('รูปแบบ Webhook URL ไม่ถูกต้อง');
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Webhook URL ต้องขึ้นต้นด้วย https:// เท่านั้น');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('ไม่อนุญาตให้ฝังข้อมูลยืนยันตัวตนใน Webhook URL');
+  }
+  if (parsed.port && parsed.port !== '443') {
+    throw new Error('ไม่อนุญาตให้ระบุพอร์ตที่ไม่ใช่ HTTPS มาตรฐาน');
+  }
+
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (
+    !hostname ||
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal')
+  ) {
+    throw new Error('ไม่อนุญาตให้ใช้ที่อยู่เครือข่ายภายในหรือ localhost');
+  }
+
+  if (net.isIP(hostname) !== 0) {
+    if (isPrivateOrReservedIp(hostname)) {
+      throw new Error('ไม่อนุญาตให้ใช้ IP ภายในหรือ IP ต้องห้ามสำหรับ Webhook');
+    }
+    return parsed;
+  }
+
+  let resolved: Array<{ address: string }>;
+  try {
+    resolved = await dns.lookup(hostname, { all: true });
+  } catch {
+    throw new Error('ไม่สามารถตรวจสอบ DNS ของโดเมน Webhook URL ได้');
+  }
+  if (!resolved || resolved.length === 0) {
+    throw new Error('ไม่พบที่อยู่ปลายทางของโดเมน Webhook URL');
+  }
+  for (const entry of resolved) {
+    if (isPrivateOrReservedIp(entry.address)) {
+      throw new Error('โดเมนของ Webhook ชี้ไปยัง IP เครือข่ายภายในที่ไม่อนุญาต');
+    }
+  }
+  return parsed;
+}
+
+function maskWebhookUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const pathParts = parsed.pathname.split('/').filter(Boolean);
+    const tail = pathParts.length > 0 ? pathParts[pathParts.length - 1] : '';
+    const visibleTail = tail.length > 6 ? `...${tail.slice(-4)}` : '...';
+    const prefix = pathParts.length > 1 ? `/${pathParts.slice(0, -1).join('/')}` : '';
+    return `${parsed.origin}${prefix}/${visibleTail}`;
+  } catch {
+    return '***';
+  }
+}
+
+function sanitizeSafeHttpUrl(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const trimmed = raw.trim().slice(0, 1000);
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.toString();
+    }
+  } catch {
+    // ignore invalid URL
+  }
+  return '';
+}
+
+function parseWebhookEvents(rawJson: string): WebhookEventType[] {
+  try {
+    const parsed = JSON.parse(rawJson);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is WebhookEventType =>
+      typeof item === 'string' && ALLOWED_WEBHOOK_EVENTS.has(item as WebhookEventType)
+    );
+  } catch {
+    return [];
+  }
+}
+
+function serializeTeamWebhookRow(row: TeamWebhookRow) {
+  return {
+    team_id: row.team_id,
+    has_webhook: Boolean(row.webhook_url),
+    masked_url: row.webhook_url ? maskWebhookUrl(row.webhook_url) : '',
+    enabled: Boolean(row.enabled),
+    events: parseWebhookEvents(row.events_json),
+    last_status: row.last_status === 'success' || row.last_status === 'error' ? row.last_status : null,
+    last_error: row.last_error ?? '',
+    last_sent_at: row.last_sent_at ?? null,
+    updated_at: row.updated_at ?? null,
+  };
+}
+
+function formatWebhookEventTitle(eventType: WebhookEventType): string {
+  switch (eventType) {
+    case 'escalation':
+      return 'ส่งต่อเคส (Escalate)';
+    case 'mention':
+      return 'มีการแท็ก @Mention ใน Internal Note';
+    case 'sla_due':
+      return 'เคสถึงกำหนด SLA วันนี้';
+    case 'sla_overdue':
+      return 'เคสเกินกำหนด SLA';
+  }
+}
+
+function getWebhookEventColor(eventType: WebhookEventType): { hex: string; int: number } {
+  switch (eventType) {
+    case 'escalation':
+      return { hex: '#4338ca', int: 0x4338ca };
+    case 'mention':
+      return { hex: '#2563eb', int: 0x2563eb };
+    case 'sla_due':
+      return { hex: '#d97706', int: 0xd97706 };
+    case 'sla_overdue':
+      return { hex: '#dc2626', int: 0xdc2626 };
+  }
+}
+
+function buildWebhookPayloadForTarget(
+  targetUrl: URL,
+  data: {
+    eventType: WebhookEventType;
+    title: string;
+    message: string;
+    teamId: string;
+    caseId: string;
+    caseNo: string;
+    caseUrl: string;
+    issueSummary: string;
+    slaDueAt: string;
+    actorName: string;
+    notePreview: string;
+    isTest?: boolean;
+  }
+): Record<string, unknown> {
+  const host = targetUrl.hostname.toLowerCase();
+  const color = getWebhookEventColor(data.eventType);
+  const timestamp = new Date().toISOString();
+
+  const lines = [
+    `เคส: ${data.caseNo}${data.issueSummary ? ` — ${data.issueSummary}` : ''}`,
+    ...(data.actorName ? [`ผู้ดำเนินการ: ${data.actorName}`] : []),
+    ...(data.slaDueAt ? [`กำหนด SLA: ${data.slaDueAt}`] : []),
+    ...(data.notePreview ? [`รายละเอียด: ${data.notePreview}`] : []),
+    ...(data.caseUrl ? [`ลิงก์เคส: ${data.caseUrl}`] : []),
+  ];
+  const fullBody = [data.title, data.message, ...lines].filter(Boolean).join('\n');
+
+  // Discord Webhook
+  if (host === 'discord.com' || host.endsWith('.discord.com') || host === 'discordapp.com' || host.endsWith('.discordapp.com')) {
+    return {
+      username: 'CRM Desk',
+      content: `**${data.title}**`,
+      embeds: [
+        {
+          title: `${data.caseNo}${data.issueSummary ? ` — ${data.issueSummary}` : ''}`.slice(0, 250),
+          description: data.message.slice(0, 1500),
+          url: data.caseUrl || undefined,
+          color: color.int,
+          fields: [
+            ...(data.actorName ? [{ name: 'ผู้ดำเนินการ', value: data.actorName, inline: true }] : []),
+            ...(data.slaDueAt ? [{ name: 'กำหนด SLA', value: data.slaDueAt, inline: true }] : []),
+            ...(data.notePreview ? [{ name: 'หมายเหตุ', value: data.notePreview.slice(0, 1000), inline: false }] : []),
+          ],
+          timestamp,
+        },
+      ],
+    };
+  }
+
+  // Slack Webhook
+  if (host === 'hooks.slack.com') {
+    return {
+      text: `${data.title}: ${data.caseNo}`,
+      attachments: [
+        {
+          color: color.hex,
+          title: `${data.title} — ${data.caseNo}`,
+          title_link: data.caseUrl || undefined,
+          text: [data.message, ...lines].filter(Boolean).join('\n'),
+        },
+      ],
+    };
+  }
+
+  // Google Chat Webhook
+  if (host === 'chat.googleapis.com') {
+    return {
+      text: `*${data.title}*\n${[data.message, ...lines].filter(Boolean).join('\n')}`,
+    };
+  }
+
+  // Generic / n8n / Make / Rocket.Chat / Custom Webhook JSON
+  return {
+    event: data.isTest ? 'test' : data.eventType,
+    title: data.title,
+    message: data.message,
+    text: fullBody,
+    team_id: data.teamId,
+    case_id: data.caseId,
+    case_no: data.caseNo,
+    case_url: data.caseUrl || null,
+    issue_summary: data.issueSummary,
+    sla_due_at: data.slaDueAt || null,
+    actor_name: data.actorName || null,
+    note_preview: data.notePreview || null,
+    timestamp,
+  };
+}
+
+async function deliverWebhookRequest(
+  rawUrl: string,
+  payloadInput: Parameters<typeof buildWebhookPayloadForTarget>[1]
+): Promise<void> {
+  const parsedUrl = await validateAndCheckWebhookUrl(rawUrl);
+  const body = buildWebhookPayloadForTarget(parsedUrl, payloadInput);
+  const resp = await fetch(parsedUrl.toString(), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'CRMDesk-Webhook/1.0',
+    },
+    body: JSON.stringify(body),
+    redirect: 'error',
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '');
+    throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 140)}` : ''}`);
   }
 }
 
@@ -246,7 +661,8 @@ function resolveWritableDataDir(): string {
 async function startServer(): Promise<void> {
   const app = express();
   const httpServer = http.createServer(app);
-  const firebaseApiKey = loadFirebaseApiKey();
+  const firebaseCfg = loadFirebaseServerConfig();
+  const firebaseApiKey = firebaseCfg.apiKey;
 
   // Persistent local storage for Internal Note attachments (with tmp fallback if .data is read-only)
   const dataDir = resolveWritableDataDir();
@@ -269,6 +685,21 @@ async function startServer(): Promise<void> {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_note_attachments_case ON note_attachments(case_id);
+    CREATE TABLE IF NOT EXISTS team_webhooks (
+      team_id TEXT PRIMARY KEY,
+      webhook_url TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      events_json TEXT NOT NULL,
+      last_status TEXT,
+      last_error TEXT,
+      last_sent_at TEXT,
+      updated_by TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS webhook_dedup (
+      dedup_key TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL
+    );
   `);
 
   const insertStmt = db.prepare(`
@@ -283,6 +714,30 @@ async function startServer(): Promise<void> {
   const deleteStmt = db.prepare(`
     DELETE FROM note_attachments WHERE id = ? AND case_id = ?
   `);
+
+  const listWebhooksStmt = db.prepare(`SELECT * FROM team_webhooks`);
+  const getWebhookStmt = db.prepare(`SELECT * FROM team_webhooks WHERE team_id = ?`);
+  const upsertWebhookStmt = db.prepare(`
+    INSERT INTO team_webhooks (
+      team_id, webhook_url, enabled, events_json, last_status, last_error, last_sent_at, updated_by, updated_at
+    ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+    ON CONFLICT(team_id) DO UPDATE SET
+      webhook_url = excluded.webhook_url,
+      enabled = excluded.enabled,
+      events_json = excluded.events_json,
+      updated_by = excluded.updated_by,
+      updated_at = excluded.updated_at
+  `);
+  const updateWebhookStatusStmt = db.prepare(`
+    UPDATE team_webhooks
+    SET last_status = ?, last_error = ?, last_sent_at = ?
+    WHERE team_id = ?
+  `);
+  const deleteWebhookStmt = db.prepare(`DELETE FROM team_webhooks WHERE team_id = ?`);
+  const insertDedupStmt = db.prepare(`
+    INSERT OR IGNORE INTO webhook_dedup (dedup_key, created_at) VALUES (?, ?)
+  `);
+  const pruneDedupStmt = db.prepare(`DELETE FROM webhook_dedup WHERE created_at < ?`);
 
   const uploadSessions = new Map<string, UploadSession>();
 
@@ -304,11 +759,17 @@ async function startServer(): Promise<void> {
         cleanupSession(session);
       }
     }
+    try {
+      pruneDedupStmt.run(now - DEDUP_RETENTION_MS);
+    } catch {
+      // ignore dedup prune error
+    }
   }, 5 * 60 * 1000);
   cleanupTimer.unref();
 
   interface AuthenticatedRequest extends Request {
     authUid?: string;
+    staffUser?: VerifiedStaffUser;
   }
 
   const requireFirebaseAuth = async (
@@ -325,9 +786,276 @@ async function startServer(): Promise<void> {
     next();
   };
 
+  const requireActiveStaff = async (
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    const tokenInfo = await verifyFirebaseTokenDetails(req.header('authorization'), firebaseApiKey);
+    if (!tokenInfo) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบใหม่ก่อนทำรายการ' });
+      return;
+    }
+    const staff = await fetchActiveStaffProfile(tokenInfo, firebaseCfg);
+    if (!staff) {
+      res.status(403).json({ error: 'บัญชีของคุณยังไม่มีสิทธิ์ใช้งานในระบบ' });
+      return;
+    }
+    req.authUid = staff.uid;
+    req.staffUser = staff;
+    next();
+  };
+
+  const requireAdminStaff = async (
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    const staff = req.staffUser;
+    if (!staff) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบใหม่ก่อนทำรายการ' });
+      return;
+    }
+    const isAdmin = await isFirebaseAdminUser(staff, firebaseCfg);
+    if (!isAdmin) {
+      res.status(403).json({ error: 'เฉพาะผู้ดูแลระบบ (Admin) เท่านั้นที่จัดการ Webhook ได้' });
+      return;
+    }
+    next();
+  };
+
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, backend: 'firebase', time: new Date().toISOString() });
   });
+
+  // ==================== ADMIN & TEAM WEBHOOK ROUTES ====================
+  app.get('/api/admin/webhooks', requireActiveStaff, requireAdminStaff, (_req, res) => {
+    const rows = listWebhooksStmt.all() as TeamWebhookRow[];
+    res.json({ webhooks: rows.map(serializeTeamWebhookRow) });
+  });
+
+  app.put(
+    '/api/admin/webhooks/:teamId',
+    requireActiveStaff,
+    requireAdminStaff,
+    express.json({ limit: '16kb' }),
+    async (req: AuthenticatedRequest, res) => {
+      const teamId = String(req.params.teamId ?? '').trim();
+      if (!VALID_ID_RE.test(teamId)) {
+        res.status(400).json({ error: 'รหัสทีมไม่ถูกต้อง' });
+        return;
+      }
+
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const rawUrl = typeof body.webhook_url === 'string' ? body.webhook_url.trim() : '';
+      const existingRow = getWebhookStmt.get(teamId) as TeamWebhookRow | undefined;
+
+      let finalUrl = existingRow?.webhook_url ?? '';
+      if (rawUrl) {
+        try {
+          const validated = await validateAndCheckWebhookUrl(rawUrl);
+          finalUrl = validated.toString();
+        } catch (err) {
+          res.status(400).json({
+            error: err instanceof Error ? err.message : 'Webhook URL ไม่ถูกต้อง',
+          });
+          return;
+        }
+      }
+
+      if (!finalUrl) {
+        res.status(400).json({ error: 'กรุณาระบุ Webhook URL (https://...)' });
+        return;
+      }
+
+      const enabled = body.enabled !== false;
+      const rawEvents = Array.isArray(body.events) ? body.events : [];
+      const events = rawEvents.filter((item): item is WebhookEventType =>
+        typeof item === 'string' && ALLOWED_WEBHOOK_EVENTS.has(item as WebhookEventType)
+      );
+      const uniqueEvents = Array.from(new Set(events));
+      const nowIso = new Date().toISOString();
+
+      upsertWebhookStmt.run(
+        teamId,
+        finalUrl,
+        enabled ? 1 : 0,
+        JSON.stringify(uniqueEvents),
+        req.authUid ?? '',
+        nowIso
+      );
+
+      const saved = getWebhookStmt.get(teamId) as TeamWebhookRow;
+      res.json({ webhook: serializeTeamWebhookRow(saved) });
+    }
+  );
+
+  app.delete(
+    '/api/admin/webhooks/:teamId',
+    requireActiveStaff,
+    requireAdminStaff,
+    (req, res) => {
+      const teamId = String(req.params.teamId ?? '').trim();
+      if (!VALID_ID_RE.test(teamId)) {
+        res.status(400).json({ error: 'รหัสทีมไม่ถูกต้อง' });
+        return;
+      }
+      deleteWebhookStmt.run(teamId);
+      res.json({ ok: true });
+    }
+  );
+
+  app.post(
+    '/api/admin/webhooks/:teamId/test',
+    requireActiveStaff,
+    requireAdminStaff,
+    express.json({ limit: '16kb' }),
+    async (req: AuthenticatedRequest, res) => {
+      const teamId = String(req.params.teamId ?? '').trim();
+      if (!VALID_ID_RE.test(teamId)) {
+        res.status(400).json({ ok: false, error: 'รหัสทีมไม่ถูกต้อง' });
+        return;
+      }
+
+      const row = getWebhookStmt.get(teamId) as TeamWebhookRow | undefined;
+      if (!row || !row.webhook_url) {
+        res.status(404).json({ ok: false, error: 'ยังไม่ได้บันทึก Webhook URL สำหรับทีมนี้' });
+        return;
+      }
+
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const teamName = String(body.teamName ?? teamId).trim().slice(0, 80) || teamId;
+      const nowIso = new Date().toISOString();
+
+      try {
+        await deliverWebhookRequest(row.webhook_url, {
+          eventType: 'mention',
+          title: `ทดสอบแจ้งเตือน Webhook — ทีม ${teamName}`,
+          message: 'การเชื่อมต่อห้องแชทกับ CRM Desk สำเร็จ พร้อมรับแจ้งเตือน Escalate, @Mention และ SLA',
+          teamId,
+          caseId: 'test',
+          caseNo: 'CRM-TEST-001',
+          caseUrl: '',
+          issueSummary: 'ข้อความทดสอบการเชื่อมต่อ Webhook',
+          slaDueAt: new Date().toISOString().slice(0, 10),
+          actorName: req.staffUser?.displayName || 'Admin',
+          notePreview: 'ทดสอบส่งจากหน้าจัดการทีม CRM Desk',
+          isTest: true,
+        });
+        updateWebhookStatusStmt.run('success', '', nowIso, teamId);
+        const updated = getWebhookStmt.get(teamId) as TeamWebhookRow;
+        res.json({ ok: true, webhook: serializeTeamWebhookRow(updated) });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'ไม่สามารถส่งข้อความทดสอบได้';
+        updateWebhookStatusStmt.run('error', msg.slice(0, 300), nowIso, teamId);
+        const updated = getWebhookStmt.get(teamId) as TeamWebhookRow;
+        res.status(502).json({ ok: false, error: msg, webhook: serializeTeamWebhookRow(updated) });
+      }
+    }
+  );
+
+  app.post(
+    '/api/webhooks/dispatch',
+    requireActiveStaff,
+    express.json({ limit: '32kb' }),
+    async (req: AuthenticatedRequest, res) => {
+      const staff = req.staffUser;
+      if (!staff) {
+        res.status(401).json({ error: 'กรุณาเข้าสู่ระบบใหม่' });
+        return;
+      }
+
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const eventType = String(body.eventType ?? '') as WebhookEventType;
+      if (!ALLOWED_WEBHOOK_EVENTS.has(eventType)) {
+        res.status(400).json({ error: 'ประเภทเหตุการณ์ไม่ถูกต้อง' });
+        return;
+      }
+
+      const rawTeamIds = Array.isArray(body.teamIds) ? body.teamIds : [];
+      const teamIds = Array.from(
+        new Set(
+          rawTeamIds
+            .filter((t): t is string => typeof t === 'string' && VALID_ID_RE.test(t.trim()))
+            .map((t) => t.trim())
+        )
+      ).slice(0, 20);
+
+      if (teamIds.length === 0) {
+        res.json({ ok: true, sent: 0 });
+        return;
+      }
+
+      const caseId = String(body.caseId ?? '').trim();
+      if (!VALID_ID_RE.test(caseId)) {
+        res.status(400).json({ error: 'รหัสเคสไม่ถูกต้อง' });
+        return;
+      }
+
+      const caseNo = String(body.caseNo ?? caseId).trim().slice(0, 200) || caseId;
+      const caseUrl = sanitizeSafeHttpUrl(body.caseUrl);
+      const issueSummary = String(body.issueSummary ?? '').trim().slice(0, 300);
+      const slaDueAt = String(body.slaDueAt ?? '').trim().slice(0, 64);
+      const actorName =
+        String(body.actorName ?? staff.displayName ?? '').trim().slice(0, 120) || 'ผู้ใช้งาน';
+      const notePreview = String(body.notePreview ?? '').trim().slice(0, 400);
+      const extraInfo = String(body.extraInfo ?? '').trim().slice(0, 400);
+      const rawDedup = typeof body.dedupKey === 'string' ? body.dedupKey.trim().slice(0, 180) : '';
+
+      const title = formatWebhookEventTitle(eventType);
+      const message =
+        extraInfo ||
+        (eventType === 'escalation'
+          ? `มีการส่งต่อเคส ${caseNo} มายังทีมของคุณ`
+          : eventType === 'mention'
+            ? `${actorName} ได้แท็กทีมหรือผู้ร่วมงานในเคส ${caseNo}`
+            : eventType === 'sla_overdue'
+              ? `เคส ${caseNo} เกินกำหนด SLA แล้ว กรุณาเร่งตรวจสอบ`
+              : `เคส ${caseNo} ครบกำหนด SLA วันนี้`);
+
+      let sentCount = 0;
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+
+      for (const teamId of teamIds) {
+        const row = getWebhookStmt.get(teamId) as TeamWebhookRow | undefined;
+        if (!row || !row.enabled || !row.webhook_url) continue;
+        const allowedEvents = parseWebhookEvents(row.events_json);
+        if (!allowedEvents.includes(eventType)) continue;
+
+        if (rawDedup) {
+          const scopedDedup = `${rawDedup}:${teamId}`;
+          const dedupRes = insertDedupStmt.run(scopedDedup, nowMs);
+          if (dedupRes.changes === 0) {
+            continue;
+          }
+        }
+
+        try {
+          await deliverWebhookRequest(row.webhook_url, {
+            eventType,
+            title,
+            message,
+            teamId,
+            caseId,
+            caseNo,
+            caseUrl,
+            issueSummary,
+            slaDueAt,
+            actorName,
+            notePreview,
+          });
+          updateWebhookStatusStmt.run('success', '', nowIso, teamId);
+          sentCount += 1;
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : 'ส่ง Webhook ไม่สำเร็จ';
+          updateWebhookStatusStmt.run('error', errMsg.slice(0, 300), nowIso, teamId);
+        }
+      }
+
+      res.json({ ok: true, sent: sentCount });
+    }
+  );
 
   // 1) Initialize chunked upload (bypasses 32 MB Cloud Run / Nginx proxy limit for videos & large files)
   app.post(
