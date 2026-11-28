@@ -150,3 +150,30 @@ export async function playEscalationRejectedChime(): Promise<boolean> {
   triggerSynthTone(ctx, now + 0.4, 440.0, 0.42, 0.22, 'triangle'); // A4
   return true;
 }
+
+/**
+ * Distinct chime for new Internal Note bell notifications (3-tone crisp chime for @Mention).
+ */
+export async function playInternalNoteChime(isMention = false): Promise<boolean> {
+  const ctx = getAudioContext();
+  if (!ctx) return false;
+  if (ctx.state === 'suspended') {
+    try {
+      await ctx.resume();
+    } catch {
+      return false;
+    }
+  }
+  if (ctx.state !== 'running') return false;
+
+  const now = ctx.currentTime;
+  if (isMention) {
+    triggerSynthTone(ctx, now + 0.01, 587.33, 0.18, 0.15, 'sine'); // D5
+    triggerSynthTone(ctx, now + 0.12, 739.99, 0.18, 0.16, 'sine'); // F#5
+    triggerSynthTone(ctx, now + 0.24, 880.0, 0.36, 0.18, 'sine'); // A5
+  } else {
+    triggerSynthTone(ctx, now + 0.01, 587.33, 0.2, 0.14, 'sine'); // D5
+    triggerSynthTone(ctx, now + 0.14, 880.0, 0.34, 0.16, 'sine'); // A5
+  }
+  return true;
+}

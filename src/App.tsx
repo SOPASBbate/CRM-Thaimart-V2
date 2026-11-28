@@ -20,8 +20,9 @@ import { ChangePasswordModal } from './components/ChangePasswordModal.tsx';
 import { DashboardView } from './components/DashboardView.tsx';
 import { EscalationAlertModal } from './components/EscalationAlertModal.tsx';
 import { LoginView } from './components/LoginView.tsx';
+import { NoteNotificationBell } from './components/NoteNotificationBell.tsx';
 import { SlaAlertModal } from './components/SlaAlertModal.tsx';
-import { unlockAudio } from './lib/bell.ts';
+import { playInternalNoteChime, unlockAudio } from './lib/bell.ts';
 import { auth } from './lib/firebase.ts';
 import {
   acceptCaseEscalationDoc,
@@ -29,14 +30,18 @@ import {
   acknowledgeCasesBulkForUser,
   acknowledgeRejectedEscalationDoc,
   buildDashboardSummary,
+  clearReadNoteNotifications,
   deleteCaseDoc,
   enrichCasesForUser,
+  markAllNoteNotificationsRead,
+  markNoteNotificationRead,
   rejectCaseEscalationDoc,
   resolveAuthenticatedUser,
   signOutFirebase,
   subscribeActiveUsers,
   subscribeIncomingEscalations,
   subscribeMyCaseAcks,
+  subscribeMyNoteNotifications,
   subscribePositions,
   subscribeRawCases,
   subscribeRejectedOutgoingEscalations,
@@ -50,6 +55,7 @@ import type {
   CaseEscalation,
   CaseItem,
   CaseStatus,
+  NoteNotification,
   Position,
   StaffEntry,
   Team,
@@ -75,6 +81,7 @@ export default function App() {
   const [myCaseAcks, setMyCaseAcks] = useState<UserCaseAck[]>([]);
   const [incomingEscalations, setIncomingEscalations] = useState<CaseEscalation[]>([]);
   const [rejectedEscalations, setRejectedEscalations] = useState<CaseEscalation[]>([]);
+  const [noteNotifications, setNoteNotifications] = useState<NoteNotification[]>([]);
   const [loadingData, setLoadingData] = useState(true);
 
   // Live clock for real-time SLA countdowns & automatic SLA alert transitions
@@ -98,6 +105,8 @@ export default function App() {
   // Track which alert signatures were already triggered automatically
   const seenAlertKeysRef = useRef<Set<string>>(new Set());
   const seenEscalationKeysRef = useRef<Set<string>>(new Set());
+  const noteNotifsInitializedRef = useRef(false);
+  const seenNoteNotifIdsRef = useRef<Set<string>>(new Set());
   const deletingExpiredIdsRef = useRef<Set<string>>(new Set());
 
   if (firestoreError) {
@@ -115,6 +124,7 @@ export default function App() {
     setMyCaseAcks([]);
     setIncomingEscalations([]);
     setRejectedEscalations([]);
+    setNoteNotifications([]);
     setTeams([]);
     setPositions([]);
     setActiveUsers([]);
@@ -123,6 +133,8 @@ export default function App() {
     setEscalationModalOpen(false);
     seenAlertKeysRef.current.clear();
     seenEscalationKeysRef.current.clear();
+    noteNotifsInitializedRef.current = false;
+    seenNoteNotifIdsRef.current.clear();
     deletingExpiredIdsRef.current.clear();
     setActiveView('dashboard');
   }, []);
@@ -145,6 +157,8 @@ export default function App() {
         if (!active) return;
         seenAlertKeysRef.current.clear();
         seenEscalationKeysRef.current.clear();
+        noteNotifsInitializedRef.current = false;
+        seenNoteNotifIdsRef.current.clear();
         setCurrentUser(profile);
       } catch (err) {
         if (!active) return;
@@ -193,6 +207,36 @@ export default function App() {
     unsubs.push(subscribeIncomingEscalations(currentUser.uid, setIncomingEscalations, onErr));
     unsubs.push(
       subscribeRejectedOutgoingEscalations(currentUser.uid, setRejectedEscalations, onErr)
+    );
+    unsubs.push(
+      subscribeMyNoteNotifications(
+        currentUser.uid,
+        (items) => {
+          setNoteNotifications(items);
+          if (!noteNotifsInitializedRef.current) {
+            noteNotifsInitializedRef.current = true;
+            items.forEach((n) => seenNoteNotifIdsRef.current.add(n.id));
+            return;
+          }
+          let hasNewUnread = false;
+          let hasNewMention = false;
+          for (const item of items) {
+            if (!seenNoteNotifIdsRef.current.has(item.id)) {
+              seenNoteNotifIdsRef.current.add(item.id);
+              if (!item.is_read) {
+                hasNewUnread = true;
+                if (item.notification_type === 'mention') {
+                  hasNewMention = true;
+                }
+              }
+            }
+          }
+          if (hasNewUnread) {
+            void playInternalNoteChime(hasNewMention);
+          }
+        },
+        onErr
+      )
     );
     unsubs.push(
       subscribeRawCases(
@@ -382,6 +426,31 @@ export default function App() {
       setEditingCase(matched);
       setCaseModalOpen(true);
     }
+  };
+
+  const handleSelectNoteNotification = async (
+    notif: NoteNotification
+  ): Promise<'opened' | 'unavailable'> => {
+    if (currentUser && !notif.is_read) {
+      await markNoteNotificationRead(currentUser.uid, notif.id).catch(() => {});
+    }
+    const matched = cases.find((c) => c.id === notif.case_id);
+    if (matched) {
+      setEditingCase(matched);
+      setCaseModalOpen(true);
+      return 'opened';
+    }
+    return 'unavailable';
+  };
+
+  const handleMarkAllNoteNotificationsRead = async () => {
+    if (!currentUser) return;
+    await markAllNoteNotificationsRead(currentUser.uid, noteNotifications);
+  };
+
+  const handleClearReadNoteNotifications = async () => {
+    if (!currentUser) return;
+    await clearReadNoteNotifications(currentUser.uid, noteNotifications);
   };
 
   if (!currentUser) {
@@ -614,6 +683,13 @@ export default function App() {
               <Plus className="w-3.5 h-3.5 shrink-0" />
               <span>เพิ่มเคส</span>
             </button>
+
+            <NoteNotificationBell
+              notifications={noteNotifications}
+              onSelectNotification={handleSelectNoteNotification}
+              onMarkAllRead={handleMarkAllNoteNotificationsRead}
+              onClearRead={handleClearReadNoteNotifications}
+            />
           </div>
         </header>
 

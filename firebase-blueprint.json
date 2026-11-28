@@ -377,6 +377,10 @@
           "type": "string",
           "maxLength": 4000
         },
+        "attachments": {
+          "type": "array",
+          "description": "Up to 5 initial image/video/file attachment descriptors uploaded when creating or editing the case."
+        },
         "status": {
           "type": "string",
           "enum": ["todo", "in_progress", "done"]
@@ -437,6 +441,14 @@
         "pending_escalation_id": {
           "type": "string",
           "maxLength": 128
+        },
+        "mentioned_user_ids": {
+          "type": "array",
+          "description": "Up to 20 UIDs of colleagues @mentioned in this case's internal notes so they can participate across teams."
+        },
+        "mentioned_team_ids": {
+          "type": "array",
+          "description": "Up to 20 team IDs @mentioned in this case's internal notes so all active members of those teams can view and participate."
         },
         "created_at": {
           "type": "string",
@@ -563,6 +575,14 @@
         "attachments": {
           "type": "array",
           "description": "Up to 5 file/image/video attachment descriptors stored via backend upload."
+        },
+        "mentioned_user_ids": {
+          "type": "array",
+          "description": "Up to 10 UIDs of colleagues @mentioned in this internal note."
+        },
+        "mentioned_team_ids": {
+          "type": "array",
+          "description": "Up to 10 team IDs @mentioned in this internal note."
         },
         "is_edited": {
           "type": "boolean"
@@ -932,6 +952,108 @@
         "created_at",
         "updated_at"
       ]
+    },
+    "NoteNotification": {
+      "title": "NoteNotification",
+      "description": "Per-user real-time bell notification triggered when a new Internal Note is posted on a case the user created or participated in.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "recipient_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "case_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "note_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "case_no": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "case_url": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "issue_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "author_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "author_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "author_role": {
+          "type": "string",
+          "enum": ["admin", "tl", "agent"]
+        },
+        "note_preview": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "attachment_count": {
+          "type": "integer"
+        },
+        "notification_type": {
+          "type": "string",
+          "enum": ["note", "mention"]
+        },
+        "mentioned_team_name": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "is_read": {
+          "type": "boolean"
+        },
+        "read_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "recipient_id",
+        "case_id",
+        "note_id",
+        "case_no",
+        "issue_summary",
+        "author_id",
+        "author_name",
+        "author_role",
+        "note_preview",
+        "attachment_count",
+        "is_read",
+        "read_at",
+        "created_at"
+      ]
     }
   },
   "firestore": {
@@ -966,6 +1088,10 @@
     "/users/{userId}/case_acks/{ackId}": {
       "schema": { "$ref": "#/entities/UserCaseAck" },
       "description": "Per-user SLA alert acknowledgments."
+    },
+    "/users/{userId}/note_notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/NoteNotification" },
+      "description": "Per-user bell notifications for new Internal Notes on participated cases."
     },
     "/cases/{caseId}": {
       "schema": { "$ref": "#/entities/CaseRecord" },

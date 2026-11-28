@@ -4,6 +4,7 @@ import {
   Check,
   Clock,
   ExternalLink,
+  Paperclip,
   Plus,
   Search,
 } from 'lucide-react';
@@ -267,6 +268,12 @@ export const CaseListView: React.FC<CaseListViewProps> = ({
                           <p className="text-xs text-slate-500 mt-1 line-clamp-2 leading-relaxed">
                             {item.details}
                           </p>
+                        )}
+                        {(item.attachments ?? []).length > 0 && (
+                          <div className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-blue-700">
+                            <Paperclip className="w-3 h-3 shrink-0" />
+                            <span>ไฟล์แนบเริ่มต้น {(item.attachments ?? []).length} ไฟล์</span>
+                          </div>
                         )}
                       </td>
 

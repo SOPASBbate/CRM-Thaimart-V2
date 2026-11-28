@@ -80,6 +80,7 @@ export interface CaseItem {
   shop_id: string;
   issue_summary: string;
   details: string;
+  attachments?: NoteAttachment[];
   status: CaseStatus;
   team_id: string;
   team_name: string;
@@ -96,6 +97,8 @@ export interface CaseItem {
   last_ack_by_name: string | null;
   last_ack_level: string | null;
   pending_escalation_id?: string;
+  mentioned_user_ids?: string[];
+  mentioned_team_ids?: string[];
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
@@ -149,12 +152,34 @@ export interface InternalNote {
   previous_sla_due_at: string;
   new_sla_due_at: string;
   attachments?: NoteAttachment[];
+  mentioned_user_ids?: string[];
+  mentioned_team_ids?: string[];
   is_edited: boolean;
   last_edited_by: string;
   last_edited_by_name: string;
   last_edit_log_id: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface NoteNotification {
+  id: string;
+  recipient_id: string;
+  case_id: string;
+  note_id: string;
+  case_no: string;
+  case_url?: string;
+  issue_summary: string;
+  author_id: string;
+  author_name: string;
+  author_role: RoleLevel;
+  note_preview: string;
+  attachment_count: number;
+  notification_type?: 'note' | 'mention';
+  mentioned_team_name?: string;
+  is_read: boolean;
+  read_at: string;
+  created_at: string;
 }
 
 export interface CaseEscalation {

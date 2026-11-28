@@ -31,5 +31,15 @@ assert.match(rulesSource, /match \/escalation_logs\/\{logId\}/);
 assert.match(rulesSource, /isValidCaseEscalation\(/);
 assert.match(rulesSource, /isValidCaseEscalationLog\(/);
 assert.match(rulesSource, /'case_url'/);
+assert.match(rulesSource, /match \/note_notifications\/\{notifId\}/);
+assert.match(rulesSource, /isValidNoteNotification\(/);
+assert.match(rulesSource, /isValidMentionedNoteIds\(/);
+assert.match(rulesSource, /isValidMentionedCaseIds\(/);
+assert.match(rulesSource, /canReadOrParticipateInCase\(/);
+assert.match(rulesSource, /mentioned_team_ids/);
+assert.match(rulesSource, /mentioned_team_name/);
+assert.match(rulesSource, /isValidAttachmentsList\(data\.attachments\)/);
+assert.match(rulesSource, /request\.auth\.uid in existing\(\)\.mentioned_user_ids/);
+assert.match(rulesSource, /userDoc\(\)\.team_id in existing\(\)\.mentioned_team_ids/);
 
 console.log('Verified all Firestore security rule invariants in firestore.rules.');
