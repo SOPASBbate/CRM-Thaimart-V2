@@ -37,7 +37,6 @@ import {
 import { getSafeCaseUrl, MAX_CASE_LINK_LENGTH, normalizeCaseUrl } from './caseLink.ts';
 import { MAX_CASE_MENTIONS, MAX_NOTE_MENTIONS } from './mentions.ts';
 import { computeAlertStage, computeLiveSlaState, needsUserAck, toLocalDateInput } from './sla.ts';
-import { dispatchTeamWebhook } from './webhookService.ts';
 import type {
   AckHistoryEntry,
   AlertStage,
@@ -1551,43 +1550,26 @@ export async function clearReadNoteNotifications(
 
 const VALID_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 
-async function resolveActiveUserProfiles(
+async function filterActiveUserUids(
   candidateIds: string[],
   knownActiveUids?: Set<string>
-): Promise<{ activeUids: string[]; teamIdByUid: Map<string, string> }> {
+): Promise<string[]> {
   const bounded = Array.from(new Set(candidateIds)).slice(0, 200);
-  const teamIdByUid = new Map<string, string>();
-  if (bounded.length === 0) return { activeUids: [], teamIdByUid };
+  if (bounded.length === 0) return [];
 
   const activeFlags = await Promise.all(
     bounded.map(async (uid) => {
       if (knownActiveUids?.has(uid)) return uid;
       try {
         const snap = await getDoc(doc(db, 'users', uid));
-        if (!snap.exists() || snap.data()?.is_active !== true) return null;
-        const tid = String(snap.data()?.team_id ?? '').trim();
-        if (tid && VALID_ID_RE.test(tid)) {
-          teamIdByUid.set(uid, tid);
-        }
-        return uid;
+        return snap.exists() && snap.data()?.is_active === true ? uid : null;
       } catch {
         return null;
       }
     })
   );
 
-  return {
-    activeUids: activeFlags.filter((uid): uid is string => Boolean(uid)),
-    teamIdByUid,
-  };
-}
-
-async function filterActiveUserUids(
-  candidateIds: string[],
-  knownActiveUids?: Set<string>
-): Promise<string[]> {
-  const { activeUids } = await resolveActiveUserProfiles(candidateIds, knownActiveUids);
-  return activeUids;
+  return activeFlags.filter((uid): uid is string => Boolean(uid));
 }
 
 async function resolveActiveTeamMembers(
@@ -1771,14 +1753,11 @@ export async function createInternalNoteDoc(
   );
   const rawTeamMentions = sanitizeIdArray(input.mentionedTeamIds, MAX_NOTE_MENTIONS);
 
-  const [userMentionResolution, teamMentionResolution] = await Promise.all([
-    rawMentions.length > 0
-      ? resolveActiveUserProfiles(rawMentions)
-      : Promise.resolve({ activeUids: [] as string[], teamIdByUid: new Map<string, string>() }),
+  const [activeMentionUids, teamMentionResolution] = await Promise.all([
+    rawMentions.length > 0 ? filterActiveUserUids(rawMentions) : Promise.resolve([]),
     resolveActiveTeamMembers(rawTeamMentions, currentUser.uid),
   ]);
 
-  const activeMentionUids = userMentionResolution.activeUids;
   const activeTeamIds = teamMentionResolution.validTeamIds.slice(0, MAX_NOTE_MENTIONS);
   const mentionSet = new Set(activeMentionUids);
 
@@ -1881,41 +1860,6 @@ export async function createInternalNoteDoc(
   await batch
     .commit()
     .catch((err) => handleFirestoreError(err, OperationType.WRITE, `cases/${caseItem.id}/internal_notes`));
-
-  if (activeTeamIds.length > 0 || activeMentionUids.length > 0) {
-    const webhookTeamIds = Array.from(
-      new Set([
-        ...activeTeamIds,
-        ...activeMentionUids
-          .map((uid) => userMentionResolution.teamIdByUid.get(uid) ?? '')
-          .filter(Boolean),
-      ])
-    );
-    if (webhookTeamIds.length > 0) {
-      const resolvedCaseUrl =
-        getSafeCaseUrl(caseItem.case_url) ?? getSafeCaseUrl(caseItem.case_no);
-      const teamNames = activeTeamIds
-        .map((tid) => teamMentionResolution.teamNameById.get(tid))
-        .filter((n): n is string => Boolean(n));
-      const preview = (
-        content || (attachments.length > 0 ? `แนบไฟล์ ${attachments.length} รายการ` : '')
-      ).slice(0, 300);
-
-      void dispatchTeamWebhook({
-        eventType: 'mention',
-        teamIds: webhookTeamIds,
-        dedupKey: `mention:${noteRef.id}:create`,
-        caseId: caseItem.id,
-        caseNo: caseItem.case_no,
-        caseUrl: resolvedCaseUrl ?? '',
-        issueSummary: caseItem.issue_summary,
-        slaDueAt: toLocalDateInput(caseItem.sla_due_at) || caseItem.sla_due_at,
-        actorName: safeAuthorName,
-        notePreview: preview,
-        ...(teamNames.length > 0 ? { extraInfo: `แท็กทีม: ${teamNames.join(', ')}` } : {}),
-      });
-    }
-  }
 }
 
 export async function updateInternalNoteDoc(
@@ -1951,23 +1895,17 @@ export async function updateInternalNoteDoc(
   const oldTeamSet = new Set(oldTeamMentions);
   const newlyMentionedTeamIds = rawNextTeamMentions.filter((tid) => !oldTeamSet.has(tid));
 
-  const [userMentionResolution, teamValidationResult, newlyMentionedTeamResolution] =
-    await Promise.all([
-      input.mentionedUserIds !== undefined && rawNextMentions.length > 0
-        ? resolveActiveUserProfiles(rawNextMentions)
-        : Promise.resolve({
-            activeUids: rawNextMentions,
-            teamIdByUid: new Map<string, string>(),
-          }),
-      input.mentionedTeamIds !== undefined && rawNextTeamMentions.length > 0
-        ? resolveActiveTeamMembers(rawNextTeamMentions, currentUser.uid)
-        : Promise.resolve(null),
-      newlyMentionedTeamIds.length > 0
-        ? resolveActiveTeamMembers(newlyMentionedTeamIds, currentUser.uid)
-        : Promise.resolve(null),
-    ]);
-
-  const nextMentions = userMentionResolution.activeUids;
+  const [nextMentions, teamValidationResult, newlyMentionedTeamResolution] = await Promise.all([
+    input.mentionedUserIds !== undefined && rawNextMentions.length > 0
+      ? filterActiveUserUids(rawNextMentions)
+      : Promise.resolve(rawNextMentions),
+    input.mentionedTeamIds !== undefined && rawNextTeamMentions.length > 0
+      ? resolveActiveTeamMembers(rawNextTeamMentions, currentUser.uid)
+      : Promise.resolve(null),
+    newlyMentionedTeamIds.length > 0
+      ? resolveActiveTeamMembers(newlyMentionedTeamIds, currentUser.uid)
+      : Promise.resolve(null),
+  ]);
 
   const nextTeamMentions = teamValidationResult
     ? teamValidationResult.validTeamIds.slice(0, MAX_NOTE_MENTIONS)
@@ -2124,42 +2062,6 @@ export async function updateInternalNoteDoc(
     .catch((err) =>
       handleFirestoreError(err, OperationType.UPDATE, `cases/${caseItem.id}/internal_notes/${note.id}`)
     );
-
-  const newlyValidTeamIds = newlyMentionedTeamResolution?.validTeamIds ?? [];
-  if (newlyValidTeamIds.length > 0 || newlyMentioned.length > 0) {
-    const webhookTeamIds = Array.from(
-      new Set([
-        ...newlyValidTeamIds,
-        ...newlyMentioned
-          .map((uid) => userMentionResolution.teamIdByUid.get(uid) ?? '')
-          .filter(Boolean),
-      ])
-    );
-    if (webhookTeamIds.length > 0) {
-      const resolvedCaseUrl =
-        getSafeCaseUrl(caseItem.case_url) ?? getSafeCaseUrl(caseItem.case_no);
-      const teamNames = newlyValidTeamIds
-        .map((tid) => newlyMentionedTeamResolution?.teamNameById.get(tid))
-        .filter((n): n is string => Boolean(n));
-      const preview = (
-        content || (nextAttachments.length > 0 ? `แนบไฟล์ ${nextAttachments.length} รายการ` : '')
-      ).slice(0, 300);
-
-      void dispatchTeamWebhook({
-        eventType: 'mention',
-        teamIds: webhookTeamIds,
-        dedupKey: `mention:${note.id}:${logRef.id}`,
-        caseId: caseItem.id,
-        caseNo: caseItem.case_no,
-        caseUrl: resolvedCaseUrl ?? '',
-        issueSummary: caseItem.issue_summary,
-        slaDueAt: toLocalDateInput(caseItem.sla_due_at) || caseItem.sla_due_at,
-        actorName: safeEditorName,
-        notePreview: preview,
-        ...(teamNames.length > 0 ? { extraInfo: `แท็กทีม: ${teamNames.join(', ')}` } : {}),
-      });
-    }
-  }
 
   // Clean up any removed attachments from backend storage after edit commits
   if (attachmentsChanged) {
@@ -2403,20 +2305,6 @@ export async function createCaseEscalationDoc(
   await batch
     .commit()
     .catch((err) => handleFirestoreError(err, OperationType.WRITE, `case_escalations/${escRef.id}`));
-
-  void dispatchTeamWebhook({
-    eventType: 'escalation',
-    teamIds: [targetUser.team_id],
-    dedupKey: `esc:${escRef.id}`,
-    caseId: caseItem.id,
-    caseNo: caseItem.case_no,
-    caseUrl: resolvedCaseUrl ?? '',
-    issueSummary: caseItem.issue_summary,
-    slaDueAt: slaDue,
-    actorName: currentUser.display_name,
-    notePreview: cleanNote,
-    extraInfo: `ส่งต่อให้ ${targetUser.display_name} (${targetUser.team_name})`,
-  });
 }
 
 export async function acceptCaseEscalationDoc(esc: CaseEscalation): Promise<void> {
@@ -2470,20 +2358,6 @@ export async function rejectCaseEscalationDoc(
   await batch
     .commit()
     .catch((err) => handleFirestoreError(err, OperationType.UPDATE, `case_escalations/${esc.id}`));
-
-  void dispatchTeamWebhook({
-    eventType: 'escalation',
-    teamIds: [esc.from_team_id],
-    dedupKey: `esc_rej:${esc.id}`,
-    caseId: esc.case_id,
-    caseNo: esc.case_no,
-    caseUrl: esc.case_url ?? '',
-    issueSummary: esc.issue_summary,
-    slaDueAt: esc.sla_due_at,
-    actorName: esc.to_user_name,
-    notePreview: cleanReason,
-    extraInfo: `ตีกลับเคสไปยังทีม ${esc.from_team_name}`,
-  });
 }
 
 export async function acknowledgeRejectedEscalationDoc(esc: CaseEscalation): Promise<void> {
